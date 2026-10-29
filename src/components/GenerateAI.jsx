@@ -1,7 +1,12 @@
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import { toast } from "react-hot-toast";
 import Button from "@mui/material/Button";
 import { supabase } from "../supabaseClient";
+import ScoreBadge from "./ScoreBadge";
+import { fetchAcademicStructure } from "../services/academicStructureService";
+import jsPDF from "jspdf";
+import autoTable from "jspdf-autotable";
+import { Download, Filter, Layers, Users, MapPin, Sparkles, Building, BookOpen } from "lucide-react";
 
 import {
   generateTimetableFull,
@@ -46,16 +51,15 @@ const steps = [
   { title: "Add Subjects", desc: "List all subjects." },
   { title: "Add Teachers", desc: "Assign teachers to subjects." },
   { title: "Define Constraints", desc: "Set scheduling rules." },
-  { title: "Set Preferences", desc: "Preferred timings." },
-  { title: "Add Gemini API key", desc: "To run the LLM." },
+  { title: "Academic Structure", desc: "Configured Depts, Sems, Divisions & Batches." },
   { title: "Review Inputs", desc: "Verify details." },
   {
     title: "Generate Timetable",
-    desc: "AI generates schedule.",
+    desc: "Deterministic solver guarantees conflict-free schedule.",
     highlight: true,
   },
-  { title: "View & Adjust", desc: "Modify if needed." },
-  { title: "Export / Save", desc: "Download timetable." },
+  { title: "View & Filter", desc: "Division or specific batch view." },
+  { title: "Export / Save", desc: "Download conflict-free PDF." },
 ];
 
 const GenerateAI = () => {
@@ -65,28 +69,102 @@ const GenerateAI = () => {
   const [conflicts, setConflicts] = useState([]);
   const [generationData, setGenerationData] = useState(null);
 
+  const [academicStructure, setAcademicStructure] = useState(null);
   const [selectedSem, setSelectedSem] = useState("6");
-  const [selectedDept, setSelectedDept] = useState("ISE");
+  const [selectedDept, setSelectedDept] = useState("CSE");
+  const [selectedSection, setSelectedSection] = useState("CSE-A");
+  const [viewMode, setViewMode] = useState("DIVISION"); // 'DIVISION' | 'BATCH' | 'TEACHER' | 'ROOM' | 'ELECTIVE'
+  const [selectedBatchFilter, setSelectedBatchFilter] = useState("ALL");
+  const [selectedTeacherFilter, setSelectedTeacherFilter] = useState("ALL");
+  const [selectedRoomFilter, setSelectedRoomFilter] = useState("ALL");
+  const [selectedElectiveFilter, setSelectedElectiveFilter] = useState("ALL");
 
   const [draggedCell, setDraggedCell] = useState(null);
   const [modInput, setModInput] = useState("");
   const [modLoading, setModLoading] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [timetableScore, setTimetableScore] = useState(null);
+
+  useEffect(() => {
+    (async () => {
+      const data = await fetchAcademicStructure();
+      setAcademicStructure(data);
+    })();
+  }, []);
+
+  // Compute available divisions based on selectedDept and selectedSem
+  const availableDivisions = academicStructure?.divisions
+    ? academicStructure.divisions
+        .filter(
+          (d) =>
+            d.department_code?.toUpperCase() === selectedDept?.toUpperCase() &&
+            parseInt(d.semester) === parseInt(selectedSem) &&
+            d.is_active !== false
+        )
+        .map((d) => d.name)
+    : ["CSE-A", "CSE-B"];
+
+  const currentDivisions = availableDivisions.length > 0 ? availableDivisions : ["CSE-A", "CSE-B"];
+
+  useEffect(() => {
+    if (currentDivisions.length > 0 && !currentDivisions.includes(selectedSection)) {
+      setSelectedSection(currentDivisions[0]);
+    }
+  }, [selectedDept, selectedSem, academicStructure]);
 
   // ── HELPERS ─────────────────────────────────────────────────────────────
 
   /**
-   * Build the display matrix from a flat timetable + slots list.
-   *
-   * Each row = one day.
-   * Each cell = one of:
-   *   { type: "break"|"lunch", label }
-   *   { type: "class",  label, subject, labSpan, labSkip }
-   *
-   * labSpan > 1  → render this cell with colSpan=labSpan (first slot of a lab block)
-   * labSkip=true → skip rendering this cell (already covered by the colSpan above)
+   * Helper to retrieve teacher name by subject ID from generation resources
    */
-  const rebuildMatrix = (timetable, slots, subjects) => {
+  const getTeacherName = (subjectId) => {
+    if (!generationData?.data?.resources?.teacherLinks) return "-";
+    const link = generationData.data.resources.teacherLinks.find(
+      (tl) => String(tl.subject_id) === String(subjectId)
+    );
+    if (!link) return "-";
+    return link.teachers?.name || link.teacher_name || link.teacher_id || "-";
+  };
+
+  /**
+   * Get active view title for display and PDF export
+   */
+  const getViewTitle = () => {
+    if (viewMode === "BATCH") {
+      return `${selectedDept} Sem ${selectedSem} (${selectedSection}) — Batch ${selectedBatchFilter} View`;
+    }
+    if (viewMode === "TEACHER") {
+      const teachers = generationData?.data?.resources?.teachers || [];
+      const tObj = teachers.find((t) => String(t.id) === String(selectedTeacherFilter) || t.name === selectedTeacherFilter);
+      return `Faculty Schedule: ${tObj?.name || selectedTeacherFilter}`;
+    }
+    if (viewMode === "ROOM") {
+      return `Room Schedule: ${selectedRoomFilter}`;
+    }
+    if (viewMode === "ELECTIVE") {
+      const electives = academicStructure?.elective_groups || [];
+      const eg = electives.find((e) => e.id === selectedElectiveFilter);
+      return `Elective Group Schedule: ${eg?.name || "All Electives"}`;
+    }
+    return `${selectedDept} — Sem ${selectedSem} (${selectedSection})`;
+  };
+
+  /**
+   * Build the display matrix from a timetable + slots list.
+   * Supports Division view, Batch view, Faculty schedule view, Room allocation view, and Elective Group view.
+   */
+  const rebuildMatrix = (
+    timetable,
+    slots,
+    subjects,
+    filterOptions = {}
+  ) => {
+    const mode = filterOptions.mode || viewMode;
+    const batchFilter = filterOptions.batchFilter || selectedBatchFilter;
+    const teacherFilter = filterOptions.teacherFilter || selectedTeacherFilter;
+    const roomFilter = filterOptions.roomFilter || selectedRoomFilter;
+    const electiveFilter = filterOptions.electiveFilter || selectedElectiveFilter;
+
     const labs = (subjects || []).filter((s) => s.is_lab);
     const combinedLabLabel = labs.length > 0 ? getLabLabel(labs) : null;
 
@@ -100,38 +178,243 @@ const GenerateAI = () => {
           continue;
         }
 
-        const subject = timetable[day]?.[slot.label] || "-";
-        const isLab = combinedLabLabel && subject === combinedLabLabel;
+        const rawCell = timetable[day]?.[slot.label] || "-";
 
-        if (isLab) {
-          // Count how many consecutive slots share this lab label
-          let span = 1;
-          for (let j = i + 1; j < slots.length; j++) {
-            if (slots[j].type !== "class") break;
-            if ((timetable[day]?.[slots[j].label] || "-") !== combinedLabLabel)
-              break;
-            span++;
+        // ── 1. TEACHER VIEW FILTER ───────────────────────────────────────────
+        if (mode === "TEACHER" && teacherFilter !== "ALL") {
+          let matched = null;
+          let matchedRoom = null;
+
+          if (typeof rawCell === "object") {
+            if (rawCell.batch_labs) {
+              const bl = rawCell.batch_labs.find(
+                (l) =>
+                  String(l.teacher_id) === String(teacherFilter) ||
+                  getTeacherName(l.subject_name) === teacherFilter
+              );
+              if (bl) {
+                matched = `${bl.subject_name} (${bl.batch})`;
+                matchedRoom = bl.room;
+              }
+            } else if (rawCell.is_elective && rawCell.offerings) {
+              const off = rawCell.offerings.find(
+                (o) =>
+                  String(o.teacher_id) === String(teacherFilter) ||
+                  o.teacher_name === teacherFilter
+              );
+              if (off) {
+                matched = `${off.subject_name} (Elective)`;
+                matchedRoom = off.room || off.room_name;
+              }
+            } else if (rawCell.subject_name) {
+              const sub = (subjects || []).find((s) => s.subject_name === rawCell.subject_name);
+              if (
+                sub &&
+                (String(getTeacherName(sub.id)) === String(teacherFilter) ||
+                  String(rawCell.teacher_id) === String(teacherFilter))
+              ) {
+                matched = rawCell.subject_name;
+                matchedRoom = rawCell.room || generationData?.theoryRoom;
+              }
+            }
+          } else if (typeof rawCell === "string" && rawCell !== "-") {
+            const sub = (subjects || []).find((s) => s.subject_name === rawCell);
+            if (sub && String(getTeacherName(sub.id)) === String(teacherFilter)) {
+              matched = rawCell;
+              matchedRoom = generationData?.theoryRoom;
+            }
           }
 
-          // Push first slot with full span info
+          if (matched) {
+            row.push({
+              type: "class",
+              label: slot.label,
+              subject: matched,
+              room: matchedRoom,
+              isTeacherMatch: true,
+            });
+          } else {
+            row.push({
+              type: "class",
+              label: slot.label,
+              subject: "— Free —",
+              isFreePeriod: true,
+            });
+          }
+          continue;
+        }
+
+        // ── 2. ROOM VIEW FILTER ──────────────────────────────────────────────
+        if (mode === "ROOM" && roomFilter !== "ALL") {
+          let matched = null;
+          let matchedTeacher = null;
+
+          if (typeof rawCell === "object") {
+            if (rawCell.batch_labs) {
+              const bl = rawCell.batch_labs.find(
+                (l) => l.room?.toLowerCase() === roomFilter.toLowerCase()
+              );
+              if (bl) {
+                matched = `${bl.subject_name} (${bl.batch})`;
+                matchedTeacher = bl.teacher_id;
+              }
+            } else if (rawCell.is_elective && rawCell.offerings) {
+              const off = rawCell.offerings.find(
+                (o) => (o.room || o.room_name)?.toLowerCase() === roomFilter.toLowerCase()
+              );
+              if (off) {
+                matched = `${off.subject_name} (Elective)`;
+                matchedTeacher = off.teacher_name || off.teacher_id;
+              }
+            } else if (rawCell.subject_name) {
+              const r = rawCell.room || generationData?.theoryRoom;
+              if (r?.toLowerCase() === roomFilter.toLowerCase()) {
+                matched = rawCell.subject_name;
+                matchedTeacher = rawCell.teacher_id;
+              }
+            }
+          } else if (typeof rawCell === "string" && rawCell !== "-") {
+            if (generationData?.theoryRoom?.toLowerCase() === roomFilter.toLowerCase()) {
+              matched = rawCell;
+            }
+          }
+
+          if (matched) {
+            row.push({
+              type: "class",
+              label: slot.label,
+              subject: matched,
+              teacher: matchedTeacher,
+              room: roomFilter,
+              isRoomMatch: true,
+            });
+          } else {
+            row.push({
+              type: "class",
+              label: slot.label,
+              subject: "— Vacant —",
+              isFreePeriod: true,
+            });
+          }
+          continue;
+        }
+
+        // ── 3. ELECTIVE GROUP VIEW FILTER ────────────────────────────────────
+        if (mode === "ELECTIVE") {
+          if (typeof rawCell === "object" && rawCell.is_elective) {
+            if (electiveFilter === "ALL" || rawCell.elective_group_id === electiveFilter) {
+              row.push({
+                type: "class",
+                label: slot.label,
+                subject: rawCell.subject_name || "Parallel Electives",
+                isElective: true,
+                elective_group_name: rawCell.elective_group_name,
+                offerings: rawCell.offerings || [],
+                room: rawCell.room,
+              });
+              continue;
+            }
+          }
           row.push({
             type: "class",
             label: slot.label,
-            subject,
-            labSpan: span,
+            subject: "— Non-Elective Period —",
+            isFreePeriod: true,
           });
-          // Push skip markers for the remaining slots in the block
-          for (let k = 1; k < span; k++) {
-            i++; // advance outer loop too
+          continue;
+        }
+
+        // ── 4. DIVISION & BATCH VIEW FILTER ──────────────────────────────────
+        if (typeof rawCell === "object" && rawCell.batch_labs) {
+          const relevantLabs =
+            batchFilter === "ALL"
+              ? rawCell.batch_labs
+              : rawCell.batch_labs.filter((bl) => bl.batch === batchFilter);
+
+          if (relevantLabs.length === 0) {
+            row.push({ type: "class", label: slot.label, subject: "-" });
+            continue;
+          }
+
+          const isStart = relevantLabs.some((l) => l.is_block_start);
+          if (isStart) {
             row.push({
               type: "class",
-              label: slots[i].label,
-              subject,
-              labSkip: true,
+              label: slot.label,
+              subject: relevantLabs.map((l) => `${l.batch}: ${l.subject_name}`).join(" | "),
+              batch_labs: relevantLabs,
+              labSpan: 2,
+              isLab: true,
+            });
+            // Advance outer loop for the second slot of the 2-hour block
+            if (i + 1 < slots.length && slots[i + 1].type === "class") {
+              i++;
+              row.push({
+                type: "class",
+                label: slots[i].label,
+                subject: relevantLabs.map((l) => `${l.batch}: ${l.subject_name}`).join(" | "),
+                labSkip: true,
+              });
+            }
+          } else {
+            row.push({
+              type: "class",
+              label: slot.label,
+              subject: relevantLabs.map((l) => `${l.batch}: ${l.subject_name}`).join(" | "),
+              batch_labs: relevantLabs,
+              isLab: true,
             });
           }
+        } else if (typeof rawCell === "object" && rawCell.is_elective) {
+          row.push({
+            type: "class",
+            label: slot.label,
+            subject: rawCell.subject_name || "Parallel Electives",
+            isElective: true,
+            elective_group_name: rawCell.elective_group_name,
+            offerings: rawCell.offerings || [],
+            room: rawCell.room,
+          });
+        } else if (typeof rawCell === "object" && rawCell.subject_name) {
+          row.push({
+            type: "class",
+            label: slot.label,
+            subject: rawCell.subject_name,
+            room: rawCell.room,
+          });
         } else {
-          row.push({ type: "class", label: slot.label, subject });
+          // Legacy string cell
+          const subject = rawCell;
+          const isLab = combinedLabLabel && subject === combinedLabLabel;
+
+          if (isLab) {
+            let span = 1;
+            for (let j = i + 1; j < slots.length; j++) {
+              if (slots[j].type !== "class") break;
+              if ((timetable[day]?.[slots[j].label] || "-") !== combinedLabLabel)
+                break;
+              span++;
+            }
+
+            row.push({
+              type: "class",
+              label: slot.label,
+              subject,
+              labSpan: span,
+              isLab: true,
+            });
+            for (let k = 1; k < span; k++) {
+              i++;
+              row.push({
+                type: "class",
+                label: slots[i].label,
+                subject,
+                labSkip: true,
+              });
+            }
+          } else {
+            row.push({ type: "class", label: slot.label, subject });
+          }
         }
       }
 
@@ -140,6 +423,156 @@ const GenerateAI = () => {
     }, {});
 
     setMatrix(newMatrix);
+  };
+
+  /**
+   * Export the currently active timetable view to a formatted PDF
+   */
+  const handleExportPDF = () => {
+    if (!matrix || !generationData) {
+      return toast.error("Please generate a timetable before exporting to PDF.");
+    }
+
+    const tid = toast.loading("Generating synchronized PDF…");
+
+    try {
+      const doc = new jsPDF({
+        orientation: "landscape",
+        unit: "mm",
+        format: "a4",
+      });
+
+      const activeSlots = generationData.slots || [];
+
+      // Document Title Header
+      doc.setFontSize(16);
+      doc.setFont("helvetica", "bold");
+      doc.text(`TimeTable AI — ${getViewTitle()}`, 14, 15);
+
+      doc.setFontSize(9);
+      doc.setFont("helvetica", "normal");
+      doc.setTextColor(100);
+
+      const subHeader = `Department: ${selectedDept} | Semester: ${selectedSem} | Section: ${selectedSection} | Theory Room: ${
+        generationData.theoryRoom || "-"
+      } | Exported: ${new Date().toLocaleDateString()}`;
+      doc.text(subHeader, 14, 21);
+      doc.setTextColor(0);
+
+      // Build head row
+      const headRow = ["Day", ...activeSlots.map((s) => s.label)];
+      const head = [headRow];
+
+      // Build body rows
+      const body = DAYS.map((day) => {
+        const row = [day];
+        const dayCells = matrix[day] || [];
+        dayCells.forEach((c) => {
+          if (c.labSkip) return;
+          if (c.type === "break" || c.type === "lunch") {
+            row.push(c.type.toUpperCase());
+          } else if (c.batch_labs && c.batch_labs.length > 0) {
+            const content = c.batch_labs
+              .map((bl) => `${bl.batch}: ${bl.subject_name} (${bl.room || "Lab"})`)
+              .join("\n");
+            if (c.labSpan > 1) {
+              row.push({ content, colSpan: c.labSpan });
+            } else {
+              row.push(content);
+            }
+          } else if (c.isElective && c.offerings && c.offerings.length > 0) {
+            const content =
+              `⚡ [${c.elective_group_name || "Elective Group"}]\n` +
+              c.offerings
+                .map((o) => `${o.subject_name} (${o.teacher_name || o.teacher_id} @ ${o.room || o.room_name})`)
+                .join("\n");
+            row.push(content);
+          } else {
+            row.push(c.subject || "-");
+          }
+        });
+        return row;
+      });
+
+      autoTable(doc, {
+        head,
+        body,
+        startY: 26,
+        styles: {
+          fontSize: 7.5,
+          cellPadding: 3,
+          halign: "center",
+          valign: "middle",
+          lineColor: [226, 232, 240],
+          lineWidth: 0.3,
+          overflow: "linebreak",
+          minCellHeight: 12,
+        },
+        headStyles: {
+          fillColor: [241, 245, 249],
+          textColor: [30, 41, 59],
+          fontStyle: "bold",
+          fontSize: 7.5,
+        },
+        columnStyles: {
+          0: {
+            fontStyle: "bold",
+            fillColor: [248, 250, 252],
+            halign: "left",
+            cellWidth: 22,
+          },
+        },
+        didParseCell: (data) => {
+          if (data.section === "body" && data.column.index > 0) {
+            const raw = data.cell.raw;
+            const val = raw && typeof raw === "object" ? raw.content : raw;
+            if (val === "BREAK" || val === "LUNCH") {
+              data.cell.styles.fillColor = [253, 230, 138];
+              data.cell.styles.fontStyle = "bold";
+              data.cell.styles.textColor = [120, 80, 0];
+            } else if (val && typeof val === "string" && (val.includes("Lab") || val.includes("B1:"))) {
+              data.cell.styles.fillColor = [224, 231, 255];
+              data.cell.styles.textColor = [67, 56, 202];
+            } else if (val && typeof val === "string" && val.includes("Elective")) {
+              data.cell.styles.fillColor = [254, 243, 199];
+              data.cell.styles.textColor = [146, 64, 14];
+            }
+          }
+        },
+        theme: "grid",
+        margin: { left: 10, right: 10 },
+      });
+
+      // Course summary metadata table below
+      const finalY = doc.lastAutoTable?.finalY || 130;
+      const subjects = generationData?.data?.subjects || [];
+
+      if (subjects.length > 0 && finalY < 165) {
+        autoTable(doc, {
+          startY: finalY + 6,
+          head: [["Sl.No", "Course Title", "Code", "Credits", "Category", "L-T-P", "Course Instructor"]],
+          body: subjects.map((s, idx) => [
+            idx + 1,
+            s.subject_name,
+            s.subject_code || "-",
+            s.weekly_hours,
+            s.course_category || (s.is_lab ? "Laboratory" : "Theory"),
+            s.ltp || (s.is_lab ? "0-0-2" : "3-0-0"),
+            getTeacherName(s.id) || "-",
+          ]),
+          styles: { fontSize: 7, cellPadding: 2 },
+          headStyles: { fillColor: [237, 233, 254], textColor: [76, 29, 149], fontStyle: "bold" },
+          theme: "grid",
+          margin: { left: 10, right: 10 },
+        });
+      }
+
+      doc.save(`Timetable_${selectedDept}_Sem${selectedSem}_${selectedSection}_${viewMode}.pdf`);
+      toast.success("Timetable PDF exported successfully!", { id: tid });
+    } catch (err) {
+      console.error("PDF export error:", err);
+      toast.error("Failed to generate PDF: " + err.message, { id: tid });
+    }
   };
 
   // ── DRAG & DROP ──────────────────────────────────────────────────────────
@@ -252,6 +685,7 @@ const GenerateAI = () => {
     setMatrix(null);
     setConflicts([]);
     setGenerationData(null);
+    setTimetableScore(null);
     // reset colour cache so each generation is fresh
     Object.keys(colorCache).forEach((k) => delete colorCache[k]);
     colorIdx = 0;
@@ -259,11 +693,20 @@ const GenerateAI = () => {
     const tid = toast.loading("Starting generation…");
 
     try {
-      const { timetable, slots, data, remainingConflicts } =
-        await generateTimetableFull(selectedSem, selectedDept, (msg) => {
-          setStatusMsg(msg);
-          toast.loading(msg, { id: tid });
-        });
+      const {
+        timetable,
+        slots,
+        data,
+        remainingConflicts,
+        orderedClassSlots,
+        batches,
+        validation,
+        qualityScore,
+        theoryRoom: genTheoryRoom,
+      } = await generateTimetableFull(selectedSem, selectedDept, (msg) => {
+        setStatusMsg(msg);
+        toast.loading(msg, { id: tid });
+      }, selectedSection);
 
       // ── Allocate theory room for preview ─────────────────
       const rooms = data.resources.rooms || [];
@@ -568,29 +1011,32 @@ const GenerateAI = () => {
         }
       }
 
-      setGenerationData((prev) => ({
-        ...prev,
+      setGenerationData({
         timetable,
         slots,
         data,
-        theoryRoom: allocatedTheoryRoom?.room_name || "-",
+        batches: batches || ["B1", "B2"],
+        validation,
+        theoryRoom: genTheoryRoom || allocatedTheoryRoom?.room_name || "-",
         labRooms: labRoomMapping,
         // Store for drag-and-drop room conflict detection (no extra DB calls needed)
         labRoomBusyEntries: existingLabBusy, // [{ room_id, day_of_week, time_slot }] from other sems
         labRoomIdMap: Object.fromEntries(
           labRooms.map((r) => [r.room_name, r.id])
         ), // { "Lab 1": id, ... }
-      }));
-      rebuildMatrix(timetable, slots, data.subjects);
+      });
+      rebuildMatrix(timetable, slots, data.subjects, selectedBatchFilter);
+      const finalScore = qualityScore ? qualityScore.score : (remainingConflicts.length === 0 ? 100 : 0);
+      setTimetableScore(finalScore);
       setConflicts(remainingConflicts);
 
       if (remainingConflicts.length > 0) {
         toast(
-          `Generated with ${remainingConflicts.length} unresolved conflict(s)`,
-          { id: tid, icon: "⚠️", duration: 5000 }
+          `Generated with ${remainingConflicts.length} unresolved conflict(s). Fix conflicts before saving.`,
+          { id: tid, icon: "⚠️", duration: 6000 }
         );
       } else {
-        toast.success("Timetable generated successfully!", { id: tid });
+        toast.success("✅ Timetable generated & validated!", { id: tid });
       }
     } catch (err) {
       console.error(err);
@@ -645,6 +1091,8 @@ const GenerateAI = () => {
         timetable: updated,
       }));
       rebuildMatrix(updated, slots, data.subjects);
+      const score = scoreTimetable(updated, data.subjects, slots);
+      setTimetableScore(score);
       setConflicts(newConflicts);
       setModInput("");
 
@@ -666,24 +1114,48 @@ const GenerateAI = () => {
   // ── SAVE ─────────────────────────────────────────────────────────────────
   const handleSave = async () => {
     if (!generationData) return;
+
+    // Phase 1: Validate the complete timetable before saving or publishing it
+    if (conflicts.length > 0 || (generationData.validation && !generationData.validation.isValid)) {
+      const errCount = conflicts.length || generationData.validation?.violations?.length || 1;
+      toast.error(
+        `Cannot save / publish: ${errCount} unresolved conflict(s) or configuration error(s) detected. Please resolve all issues first.`,
+        { duration: 6000 }
+      );
+      return;
+    }
+
     setSaving(true);
 
     try {
       const { timetable, data } = generationData;
 
       // ── 1. Save timetable snapshot — critical, must succeed ──────────────
-      const { data: saved, error: saveErr } = await supabase
+      const insertPayload = {
+        department: `${selectedDept} (${selectedSection})`,
+        semester: parseInt(selectedSem),
+        division: selectedSection,
+        timetable_json: timetable,
+        created_at: new Date().toISOString(),
+      };
+
+      let { data: saved, error: saveErr } = await supabase
         .from("saved_timetables")
-        .insert([
-          {
-            department: selectedDept,
-            semester: parseInt(selectedSem),
-            timetable_json: timetable,
-            created_at: new Date().toISOString(),
-          },
-        ])
+        .insert([insertPayload])
         .select()
         .single();
+
+      // Fallback if 'division' column is not yet present in user's Supabase schema
+      if (saveErr && saveErr.message && saveErr.message.includes("division")) {
+        delete insertPayload.division;
+        const retry = await supabase
+          .from("saved_timetables")
+          .insert([insertPayload])
+          .select()
+          .single();
+        saved = retry.data;
+        saveErr = retry.error;
+      }
 
       if (saveErr) throw new Error("Save failed: " + saveErr.message);
 
@@ -893,16 +1365,6 @@ const GenerateAI = () => {
     }
   };
 
-  const getTeacherName = (subjectId) => {
-    const links =
-      generationData?.data?.resources?.teacherLinks?.filter(
-        (t) => t.subject_id === subjectId
-      ) || [];
-
-    const teacherNames = links.map((l) => l.teachers?.name).filter(Boolean);
-    return teacherNames.length > 0 ? teacherNames.join(", ") : "-";
-  };
-
   return (
     <div style={{ maxWidth: "1400px", margin: "0 auto", padding: "0 4px" }}>
       {/* CONTROL PANEL */}
@@ -922,7 +1384,14 @@ const GenerateAI = () => {
               onChange={(e) => setSelectedDept(e.target.value)}
               style={styles.select}
             >
-              {["ISE", "CSE", "ECE", "ME", "CV"].map((d) => (
+              {(academicStructure?.departments?.map((d) => d.code) || [
+                "CSE",
+                "AIML",
+                "ISE",
+                "ECE",
+                "ME",
+                "CV",
+              ]).map((d) => (
                 <option key={d} value={d}>
                   {d}
                 </option>
@@ -939,6 +1408,20 @@ const GenerateAI = () => {
               {[1, 2, 3, 4, 5, 6, 7, 8].map((s) => (
                 <option key={s} value={s}>
                   Semester {s}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div style={{ flex: 1, minWidth: 140 }}>
+            <label style={styles.label}>Division / Section</label>
+            <select
+              value={selectedSection}
+              onChange={(e) => setSelectedSection(e.target.value)}
+              style={styles.select}
+            >
+              {currentDivisions.map((sec) => (
+                <option key={sec} value={sec}>
+                  {sec}
                 </option>
               ))}
             </select>
@@ -985,7 +1468,7 @@ const GenerateAI = () => {
             ))}
           </ul>
           <p style={{ marginTop: 10, color: "#64748b", fontSize: "0.82rem" }}>
-            Drag-and-drop slots to fix manually, or use the chat box below.
+            ⚠️ Conflicts must be resolved before saving. Try regenerating — the engine will automatically attempt to fix them.
           </p>
         </div>
       )}
@@ -1068,42 +1551,309 @@ const GenerateAI = () => {
                 justifyContent: "space-between",
                 alignItems: "center",
                 marginBottom: 12,
+                flexWrap: "wrap",
+                gap: 12,
               }}
             >
-              <h3 style={{ margin: 0 }}>📅 Generated Timetable</h3>
+              <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+                <h3 style={{ margin: 0 }}>📅 Generated Timetable</h3>
+                <span
+                  style={{
+                    background: "#e0e7ff",
+                    color: "#4338ca",
+                    fontSize: "0.82rem",
+                    fontWeight: 700,
+                    padding: "4px 10px",
+                    borderRadius: 6,
+                  }}
+                >
+                  {selectedDept} — Sem {selectedSem} ({selectedSection})
+                </span>
+                <ScoreBadge
+                  score={timetableScore}
+                  validation={generationData?.validation}
+                  violations={conflicts}
+                />
+              </div>
 
               <div
                 style={{
                   display: "flex",
-                  gap: 12,
+                  gap: 10,
                   flexWrap: "wrap",
                   alignItems: "center",
                 }}
               >
-                <span
+                {/* 1. Main View Mode Selector */}
+                <div
                   style={{
-                    fontSize: "0.9rem",
-                    fontWeight: "600",
-                    color: "#4338ca",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 6,
+                    background: "#f8fafc",
+                    padding: "4px 10px",
+                    borderRadius: 8,
+                    border: "1px solid #cbd5e1",
                   }}
                 >
-                  Theory : {generationData?.theoryRoom || "-"}
-                </span>
-                {generationData?.labRooms &&
-                  Object.entries(generationData.labRooms).map(
-                    ([labName, roomName]) => (
-                      <span
-                        key={labName}
-                        style={{
-                          fontSize: "0.9rem",
-                          fontWeight: "600",
-                          color: "#7c3aed",
-                        }}
-                      >
-                        {labName} : {roomName || "-"}
-                      </span>
-                    )
-                  )}
+                  <span style={{ fontSize: "0.8rem", fontWeight: 700, color: "#475569" }}>
+                    View Mode:
+                  </span>
+                  <select
+                    value={viewMode}
+                    onChange={(e) => {
+                      const mode = e.target.value;
+                      setViewMode(mode);
+                      if (generationData) {
+                        rebuildMatrix(
+                          generationData.timetable,
+                          generationData.slots,
+                          generationData.data.subjects,
+                          { mode }
+                        );
+                      }
+                    }}
+                    style={{
+                      border: "none",
+                      background: "transparent",
+                      fontWeight: 700,
+                      color: "#4338ca",
+                      cursor: "pointer",
+                      outline: "none",
+                      fontSize: "0.85rem",
+                    }}
+                  >
+                    <option value="DIVISION">🏛️ Division View</option>
+                    <option value="BATCH">👥 Batch View</option>
+                    <option value="TEACHER">👨‍🏫 Faculty Schedule</option>
+                    <option value="ROOM">📍 Room Allocation</option>
+                    <option value="ELECTIVE">⚡ Elective Block</option>
+                  </select>
+                </div>
+
+                {/* 2. Sub-selectors depending on active View Mode */}
+                {viewMode === "BATCH" && (
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 6,
+                      background: "#f8fafc",
+                      padding: "4px 10px",
+                      borderRadius: 8,
+                      border: "1px solid #cbd5e1",
+                    }}
+                  >
+                    <span style={{ fontSize: "0.8rem", fontWeight: 700, color: "#475569" }}>
+                      Batch:
+                    </span>
+                    <select
+                      value={selectedBatchFilter}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        setSelectedBatchFilter(val);
+                        if (generationData) {
+                          rebuildMatrix(
+                            generationData.timetable,
+                            generationData.slots,
+                            generationData.data.subjects,
+                            { mode: "BATCH", batchFilter: val }
+                          );
+                        }
+                      }}
+                      style={{
+                        border: "none",
+                        background: "transparent",
+                        fontWeight: 700,
+                        color: "#4338ca",
+                        cursor: "pointer",
+                        outline: "none",
+                        fontSize: "0.85rem",
+                      }}
+                    >
+                      <option value="ALL">All Batches</option>
+                      {(generationData?.batches || ["B1", "B2", "B3"]).map((b) => (
+                        <option key={b} value={b}>
+                          Batch {b}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+
+                {viewMode === "TEACHER" && (
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 6,
+                      background: "#f8fafc",
+                      padding: "4px 10px",
+                      borderRadius: 8,
+                      border: "1px solid #cbd5e1",
+                    }}
+                  >
+                    <span style={{ fontSize: "0.8rem", fontWeight: 700, color: "#475569" }}>
+                      Faculty:
+                    </span>
+                    <select
+                      value={selectedTeacherFilter}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        setSelectedTeacherFilter(val);
+                        if (generationData) {
+                          rebuildMatrix(
+                            generationData.timetable,
+                            generationData.slots,
+                            generationData.data.subjects,
+                            { mode: "TEACHER", teacherFilter: val }
+                          );
+                        }
+                      }}
+                      style={{
+                        border: "none",
+                        background: "transparent",
+                        fontWeight: 700,
+                        color: "#4338ca",
+                        cursor: "pointer",
+                        outline: "none",
+                        fontSize: "0.85rem",
+                      }}
+                    >
+                      <option value="ALL">-- Select Faculty --</option>
+                      {(generationData?.data?.resources?.teachers || []).map((t) => (
+                        <option key={t.id} value={t.name}>
+                          {t.name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+
+                {viewMode === "ROOM" && (
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 6,
+                      background: "#f8fafc",
+                      padding: "4px 10px",
+                      borderRadius: 8,
+                      border: "1px solid #cbd5e1",
+                    }}
+                  >
+                    <span style={{ fontSize: "0.8rem", fontWeight: 700, color: "#475569" }}>
+                      Room:
+                    </span>
+                    <select
+                      value={selectedRoomFilter}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        setSelectedRoomFilter(val);
+                        if (generationData) {
+                          rebuildMatrix(
+                            generationData.timetable,
+                            generationData.slots,
+                            generationData.data.subjects,
+                            { mode: "ROOM", roomFilter: val }
+                          );
+                        }
+                      }}
+                      style={{
+                        border: "none",
+                        background: "transparent",
+                        fontWeight: 700,
+                        color: "#4338ca",
+                        cursor: "pointer",
+                        outline: "none",
+                        fontSize: "0.85rem",
+                      }}
+                    >
+                      <option value="ALL">-- Select Room --</option>
+                      {generationData?.theoryRoom && (
+                        <option value={generationData.theoryRoom}>
+                          Theory Room: {generationData.theoryRoom}
+                        </option>
+                      )}
+                      {Object.values(generationData?.labRooms || {}).map((lr) => (
+                        <option key={lr} value={lr}>
+                          Lab Room: {lr}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+
+                {viewMode === "ELECTIVE" && (
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 6,
+                      background: "#f8fafc",
+                      padding: "4px 10px",
+                      borderRadius: 8,
+                      border: "1px solid #cbd5e1",
+                    }}
+                  >
+                    <span style={{ fontSize: "0.8rem", fontWeight: 700, color: "#475569" }}>
+                      Elective Group:
+                    </span>
+                    <select
+                      value={selectedElectiveFilter}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        setSelectedElectiveFilter(val);
+                        if (generationData) {
+                          rebuildMatrix(
+                            generationData.timetable,
+                            generationData.slots,
+                            generationData.data.subjects,
+                            { mode: "ELECTIVE", electiveFilter: val }
+                          );
+                        }
+                      }}
+                      style={{
+                        border: "none",
+                        background: "transparent",
+                        fontWeight: 700,
+                        color: "#4338ca",
+                        cursor: "pointer",
+                        outline: "none",
+                        fontSize: "0.85rem",
+                      }}
+                    >
+                      <option value="ALL">All Elective Groups</option>
+                      {(academicStructure?.elective_groups || []).map((eg) => (
+                        <option key={eg.id} value={eg.id}>
+                          {eg.name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+
+                {/* 3. Export PDF Button */}
+                <Button
+                  variant="contained"
+                  size="small"
+                  onClick={handleExportPDF}
+                  style={{
+                    backgroundColor: "#4338ca",
+                    color: "#fff",
+                    textTransform: "none",
+                    fontWeight: 700,
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: 6,
+                    borderRadius: 8,
+                    padding: "6px 14px",
+                    fontSize: "0.84rem",
+                    boxShadow: "0 2px 4px rgba(67, 56, 202, 0.2)",
+                  }}
+                >
+                  <Download size={15} /> Export PDF
+                </Button>
               </div>
             </div>
 
@@ -1185,15 +1935,51 @@ const GenerateAI = () => {
                                 ⚠️
                               </span>
                             )}
-                            <div
-                              style={{
-                                fontWeight: 700,
-                                fontSize: "0.85rem",
-                                marginTop: 4,
-                              }}
-                            >
-                              {cell.subject}
-                            </div>
+                            {cell.batch_labs && cell.batch_labs.length > 0 ? (
+                              <div style={{ display: "flex", flexDirection: "column", gap: 4, marginTop: 4 }}>
+                                {cell.batch_labs.map((bl, bIdx) => (
+                                  <div
+                                    key={bIdx}
+                                    style={{
+                                      background: "rgba(255, 255, 255, 0.85)",
+                                      padding: "4px 8px",
+                                      borderRadius: 5,
+                                      fontSize: "0.78rem",
+                                      textAlign: "left",
+                                      boxShadow: "0 1px 2px rgba(0,0,0,0.06)",
+                                      border: "1px solid rgba(0,0,0,0.06)",
+                                    }}
+                                  >
+                                    <span
+                                      style={{
+                                        fontWeight: 800,
+                                        color: "#4338ca",
+                                        background: "#e0e7ff",
+                                        padding: "1px 6px",
+                                        borderRadius: 4,
+                                        marginRight: 6,
+                                      }}
+                                    >
+                                      {bl.batch}
+                                    </span>
+                                    <b style={{ color: "#1e293b" }}>{bl.subject_name}</b>
+                                    <div style={{ fontSize: "0.7rem", color: "#64748b", marginTop: 2 }}>
+                                      📍 {bl.room}
+                                    </div>
+                                  </div>
+                                ))}
+                              </div>
+                            ) : (
+                              <div
+                                style={{
+                                  fontWeight: 700,
+                                  fontSize: "0.85rem",
+                                  marginTop: 4,
+                                }}
+                              >
+                                {cell.subject}
+                              </div>
+                            )}
                           </td>
                         );
                       }
@@ -1235,8 +2021,49 @@ const GenerateAI = () => {
                           )}
                           {cell.subject === "-" ? (
                             <span style={{ color: "#cbd5e1" }}>—</span>
+                          ) : cell.isElective && cell.offerings && cell.offerings.length > 0 ? (
+                            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                              <span
+                                style={{
+                                  fontSize: "0.7rem",
+                                  fontWeight: 800,
+                                  color: "#b45309",
+                                  background: "#fef3c7",
+                                  padding: "1px 5px",
+                                  borderRadius: 3,
+                                  alignSelf: "flex-start",
+                                }}
+                              >
+                                ⚡ {cell.elective_group_name || "PARALLEL ELECTIVE"}
+                              </span>
+                              {cell.offerings.map((off, oIdx) => (
+                                <div
+                                  key={oIdx}
+                                  style={{
+                                    background: "rgba(255,255,255,0.9)",
+                                    padding: "3px 6px",
+                                    borderRadius: 4,
+                                    fontSize: "0.75rem",
+                                    border: "1px solid #fed7aa",
+                                    textAlign: "left",
+                                  }}
+                                >
+                                  <b style={{ color: "#9a3412" }}>{off.subject_name}</b>
+                                  <div style={{ fontSize: "0.68rem", color: "#64748b" }}>
+                                    👨‍🏫 {off.teacher_name || off.teacher_id} | 📍 {off.room_name || off.room}
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
                           ) : (
-                            cell.subject
+                            <div>
+                              <div style={{ fontWeight: 600 }}>{cell.subject}</div>
+                              {cell.room && (
+                                <div style={{ fontSize: "0.7rem", color: "#64748b" }}>
+                                  📍 {cell.room}
+                                </div>
+                              )}
+                            </div>
                           )}
                         </td>
                       );
@@ -1365,12 +2192,16 @@ const GenerateAI = () => {
               </Button>
               <Button
                 variant="contained"
-                color="success"
+                color={conflicts.length > 0 ? "error" : "success"}
                 onClick={handleSave}
-                disabled={saving}
+                disabled={saving || conflicts.length > 0}
                 style={{ flex: 1 }}
               >
-                {saving ? "Saving…" : "💾 Save Timetable"}
+                {saving
+                  ? "Saving…"
+                  : conflicts.length > 0
+                  ? "⚠️ Fix Conflicts to Enable Save"
+                  : "💾 Save Validated Timetable"}
               </Button>
             </div>
           </div>

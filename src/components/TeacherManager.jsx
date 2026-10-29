@@ -2,6 +2,10 @@ import { useState, useEffect } from "react";
 import { supabase } from "../supabaseClient";
 import toast from "react-hot-toast";
 import Button from "@mui/material/Button";
+import jsPDF from "jspdf";
+import autoTable from "jspdf-autotable";
+import { createSlotsWithBreaks } from "../services/aiService";
+import CourseSelector from "./CourseSelector";
 
 const TeacherManager = () => {
   const [loading, setLoading] = useState(true);
@@ -10,10 +14,208 @@ const TeacherManager = () => {
 
   const [name, setName] = useState("");
   const [subjectCode, setSubjectCode] = useState("");
+  const [selectedCourse, setSelectedCourse] = useState(null);
+
+  const [expandedScheduleId, setExpandedScheduleId] = useState(null);
+  const [teacherBusyMap, setTeacherBusyMap] = useState({});
+  const [allTimetables, setAllTimetables] = useState([]);
+  const [activeSlots, setActiveSlots] = useState([
+    "08:00 AM-09:00 AM",
+    "09:00 AM-10:00 AM",
+    "10:00 AM-11:00 AM",
+    "11:00 AM-12:00 PM",
+    "12:00 PM-01:00 PM",
+    "01:00 PM-02:00 PM",
+    "02:00 PM-03:00 PM",
+    "03:00 PM-04:00 PM",
+  ]);
+
+  const DAYS = [
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+  ];
 
   useEffect(() => {
     fetchAll();
+    fetchTeacherAvailability();
+    fetchSavedTimetablesAndConstraints();
   }, []);
+
+  const fetchTeacherAvailability = async () => {
+    const { data } = await supabase.from("teacher_availability").select("*");
+    const map = {};
+    (data || []).forEach((row) => {
+      if (row.is_busy) {
+        if (!map[row.teacher_id]) map[row.teacher_id] = new Set();
+        map[row.teacher_id].add(`${row.day_of_week}_${row.time_slot}`);
+      }
+    });
+    setTeacherBusyMap(map);
+  };
+
+  const fetchSavedTimetablesAndConstraints = async () => {
+    const { data: ttData } = await supabase.from("saved_timetables").select("*");
+    const timetables = ttData || [];
+    setAllTimetables(timetables);
+
+    // Extract dynamic slots from constraints or saved timetables
+    const { data: conData } = await supabase.from("testconstraints").select("*").eq("id", 1).maybeSingle();
+    const collectedSlots = [];
+
+    if (conData) {
+      const slotsFromCon = createSlotsWithBreaks(conData)
+        .filter((s) => s.type === "class")
+        .map((s) => s.label);
+      collectedSlots.push(...slotsFromCon);
+    }
+
+    // Also collect any unique slot labels found in saved timetables
+    timetables.forEach((row) => {
+      const json = row.timetable_json || {};
+      Object.values(json).forEach((daySlots) => {
+        if (daySlots && typeof daySlots === "object") {
+          Object.keys(daySlots).forEach((k) => {
+            if (k && !collectedSlots.includes(k) && k !== "BREAK" && k !== "LUNCH") {
+              collectedSlots.push(k);
+            }
+          });
+        }
+      });
+    });
+
+    if (collectedSlots.length > 0) {
+      setActiveSlots(collectedSlots);
+    }
+  };
+
+  const toggleAvailabilitySlot = async (teacherId, day, slot) => {
+    const key = `${day}_${slot}`;
+    const currentSet = new Set(teacherBusyMap[teacherId] || []);
+    const isCurrentlyBusy = currentSet.has(key);
+
+    // 1. Instant optimistic UI update
+    if (isCurrentlyBusy) {
+      currentSet.delete(key);
+    } else {
+      currentSet.add(key);
+    }
+
+    setTeacherBusyMap((prev) => ({
+      ...prev,
+      [teacherId]: currentSet,
+    }));
+
+    // 2. Database sync
+    if (isCurrentlyBusy) {
+      const { error } = await supabase
+        .from("teacher_availability")
+        .delete()
+        .eq("teacher_id", teacherId)
+        .eq("day_of_week", day)
+        .eq("time_slot", slot);
+
+      if (error) {
+        toast.error("Database update failed: " + error.message);
+        fetchTeacherAvailability();
+      } else {
+        toast.success(`Slot (${day} @ ${slot.split("-")[0]}) marked AVAILABLE.`);
+      }
+    } else {
+      const { error } = await supabase.from("teacher_availability").insert([
+        {
+          teacher_id: teacherId,
+          day_of_week: day,
+          time_slot: slot,
+          is_busy: true,
+          semester_id: 0,
+        },
+      ]);
+
+      if (error) {
+        const { error: err2 } = await supabase.from("teacher_availability").insert([
+          {
+            teacher_id: teacherId,
+            day_of_week: day,
+            time_slot: slot,
+            is_busy: true,
+          },
+        ]);
+
+        if (err2) {
+          toast.error("Could not save availability: " + err2.message);
+          fetchTeacherAvailability();
+          return;
+        }
+      }
+      toast.success(`Slot (${day} @ ${slot.split("-")[0]}) marked UNAVAILABLE.`);
+    }
+  };
+
+  const exportFacultyPDF = (teacher) => {
+    const doc = new jsPDF();
+    doc.setFontSize(16);
+    doc.text(`Faculty Master Schedule: ${teacher.name}`, 14, 15);
+    doc.setFontSize(10);
+    doc.text(`Department & Cross-Semester Schedule Report`, 14, 22);
+
+    const links = teacher.teacher_subjects || [];
+    const linkedSubjects = links.map((ts) => ts.subjects).filter(Boolean);
+    const teacherSubNames = linkedSubjects.map((s) => s.subject_name?.trim().toLowerCase()).filter(Boolean);
+    const teacherSubCodes = linkedSubjects.map((s) => s.subject_code?.trim().toLowerCase()).filter(Boolean);
+
+    const rows = DAYS.map((day) => {
+      const row = [day];
+      activeSlots.forEach((slot) => {
+        let assigned = "-";
+        for (const tt of allTimetables) {
+          const timetableObj = tt.timetable_json || {};
+          const daySlots = timetableObj[day];
+          if (!daySlots) continue;
+
+          for (const [slotKey, subVal] of Object.entries(daySlots)) {
+            if (!subVal || subVal === "-") continue;
+
+            const slotMatch =
+              slotKey === slot ||
+              slotKey.split("-")[0].trim() === slot.split("-")[0].trim();
+
+            if (slotMatch) {
+              const parts = subVal.includes("/") ? subVal.split("/") : [subVal];
+              const isMatch = parts.some((p) => {
+                const cleanP = p.trim().toLowerCase();
+                return (
+                  teacherSubNames.some((n) => n === cleanP || cleanP.includes(n) || n.includes(cleanP)) ||
+                  teacherSubCodes.some((c) => c === cleanP)
+                );
+              });
+
+              if (isMatch) {
+                assigned = `${subVal} (${tt.department} S${tt.semester})`;
+                break;
+              }
+            }
+          }
+          if (assigned !== "-") break;
+        }
+        row.push(assigned);
+      });
+      return row;
+    });
+
+    autoTable(doc, {
+      head: [["Day", ...activeSlots.map((s) => s.split("-")[0])]],
+      body: rows,
+      startY: 28,
+      styles: { fontSize: 7, cellPadding: 2 },
+    });
+
+    doc.save(`${teacher.name.replace(/\s+/g, "_")}_Schedule.pdf`);
+    toast.success("Schedule exported to PDF!");
+  };
 
   const getInitials = (name) => {
     if (!name) return "";
@@ -32,7 +234,6 @@ const TeacherManager = () => {
   const fetchAll = async () => {
     setLoading(true);
 
-    // Each teacher row + all their subject assignments via teacher_subjects
     const { data: teacherData, error: te } = await supabase
       .from("teachers")
       .select(
@@ -61,16 +262,16 @@ const TeacherManager = () => {
 
   const handleAddAssignment = async (e) => {
     e.preventDefault();
-    if (!name.trim() || !subjectCode.trim())
-      return toast.error("Please fill in Teacher Name and Subject Code.");
+    if (!name.trim() || (!subjectCode.trim() && !selectedCourse))
+      return toast.error("Please fill in Teacher Name and select a Subject.");
 
     const cleanName = name.trim();
-    const code = subjectCode.toUpperCase().trim();
+    const code = (selectedCourse?.subject_code || subjectCode).toUpperCase().trim();
 
-    // Find matching subjects
-    const matched = subjects.filter(
-      (s) => s.subject_code?.toUpperCase() === code
-    );
+    // Find matching subjects (either directly the selectedCourse or by code)
+    const matched = selectedCourse
+      ? [selectedCourse]
+      : subjects.filter((s) => s.subject_code?.toUpperCase() === code);
     if (matched.length === 0)
       return toast.error(
         `No subject found with code "${code}". Register the subject first.`
@@ -151,6 +352,7 @@ const TeacherManager = () => {
     toast.success("Teacher added successfully");
     setName("");
     setSubjectCode("");
+    setSelectedCourse(null);
     fetchAll(); // no await — let it refresh in background
   };
 
@@ -281,75 +483,24 @@ const TeacherManager = () => {
             ) : null}
           </div>
 
-          {/* Subject code */}
-          <div className="form-group">
-            <label>
-              Subject Code{" "}
-              <span
-                style={{
-                  color: "#64748b",
-                  fontWeight: 400,
-                  fontSize: "0.82rem",
-                }}
-              >
-                (must match a registered subject)
-              </span>
-            </label>
-            <input
-              type="text"
-              placeholder="e.g. CS601"
-              value={subjectCode}
-              onChange={(e) => setSubjectCode(e.target.value)}
-              list="subject-code-list"
-              style={{ textTransform: "uppercase" }}
+          {/* Canonical Subject Selector */}
+          <div className="form-group" style={{ flex: 1 }}>
+            <CourseSelector
+              selectedCourse={selectedCourse}
+              selectedCourseId={selectedCourse?.id}
+              courses={subjects}
+              onSelect={(course) => {
+                setSelectedCourse(course);
+                setSubjectCode(course.subject_code || "");
+              }}
+              onClear={() => {
+                setSelectedCourse(null);
+                setSubjectCode("");
+              }}
+              label="Subject / Course"
+              placeholder="Search by code (e.g. CS601) or title..."
+              required
             />
-            <datalist id="subject-code-list">
-              {uniqueCodes.map((code) => {
-                const sub = subjects.find((s) => s.subject_code === code);
-                return (
-                  <option key={code} value={code}>
-                    {sub
-                      ? `${sub.subject_name} (${sub.department} Sem ${sub.semester})`
-                      : code}
-                  </option>
-                );
-              })}
-            </datalist>
-
-            {/* Live subject match preview */}
-            {subjectCode.trim().length >= 2 &&
-              (previewSubjects.length > 0 ? (
-                <div style={{ marginTop: 6 }}>
-                  {previewSubjects.map((s) => (
-                    <span
-                      key={s.id}
-                      style={{
-                        display: "inline-block",
-                        marginRight: 6,
-                        marginTop: 4,
-                        background: "#dcfce7",
-                        color: "#15803d",
-                        padding: "2px 8px",
-                        borderRadius: 6,
-                        fontSize: "0.78rem",
-                        fontWeight: 600,
-                      }}
-                    >
-                      ✓ {s.subject_name} — {s.department} Sem {s.semester}
-                    </span>
-                  ))}
-                </div>
-              ) : (
-                <p
-                  style={{
-                    marginTop: 5,
-                    color: "#ef4444",
-                    fontSize: "0.78rem",
-                  }}
-                >
-                  ✗ No subject found with this code
-                </p>
-              ))}
           </div>
         </div>
 
@@ -444,18 +595,41 @@ const TeacherManager = () => {
                       </p>
                     </div>
                   </div>
-                  <button
-                    className="btn-ghost"
-                    style={{
-                      color: "#ef4444",
-                      cursor: "pointer",
-                      fontSize: "0.8rem",
-                      fontWeight: 600,
-                    }}
-                    onClick={() => handleDeleteTeacher(teacher)}
-                  >
-                    Delete All
-                  </button>
+                  <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                    <button
+                      className="btn-ghost"
+                      style={{
+                        color: "#4f46e5",
+                        cursor: "pointer",
+                        fontSize: "0.8rem",
+                        fontWeight: 600,
+                        background: "#eef2ff",
+                        padding: "4px 10px",
+                        borderRadius: 6,
+                      }}
+                      onClick={() =>
+                        setExpandedScheduleId(
+                          expandedScheduleId === teacher.id ? null : teacher.id
+                        )
+                      }
+                    >
+                      {expandedScheduleId === teacher.id
+                        ? "▲ Hide Matrix"
+                        : "📅 Availability & Schedule"}
+                    </button>
+                    <button
+                      className="btn-ghost"
+                      style={{
+                        color: "#ef4444",
+                        cursor: "pointer",
+                        fontSize: "0.8rem",
+                        fontWeight: 600,
+                      }}
+                      onClick={() => handleDeleteTeacher(teacher)}
+                    >
+                      Delete All
+                    </button>
+                  </div>
                 </div>
 
                 {/* Subject assignments */}
@@ -535,6 +709,198 @@ const TeacherManager = () => {
                     })
                   )}
                 </div>
+
+                {/* Expanded Schedule & Availability Matrix */}
+                {expandedScheduleId === teacher.id && (
+                  <div
+                    style={{
+                      marginTop: 15,
+                      padding: 15,
+                      background: "#f8fafc",
+                      borderRadius: 10,
+                      border: "1px solid #cbd5e1",
+                    }}
+                  >
+                    <div
+                      style={{
+                        display: "flex",
+                        justifyContent: "space-between",
+                        alignItems: "center",
+                        marginBottom: 12,
+                      }}
+                    >
+                      <div>
+                        <h4
+                          style={{
+                            margin: 0,
+                            color: "#1e293b",
+                            fontSize: "0.9rem",
+                            fontWeight: 700,
+                          }}
+                        >
+                          📅 Availability Matrix & Assigned Slots: {teacher.name}
+                        </h4>
+                        <p
+                          style={{
+                            margin: 0,
+                            fontSize: "0.75rem",
+                            color: "#64748b",
+                          }}
+                        >
+                          Click any slot cell to toggle Availability (🟩 Available / 🟥 Blocked).
+                        </p>
+                      </div>
+                      <button
+                        style={{
+                          background: "#3b82f6",
+                          color: "#fff",
+                          border: "none",
+                          padding: "6px 12px",
+                          borderRadius: 6,
+                          fontSize: "0.78rem",
+                          fontWeight: 600,
+                          cursor: "pointer",
+                        }}
+                        onClick={() => exportFacultyPDF(teacher)}
+                      >
+                        📄 Download PDF Schedule
+                      </button>
+                    </div>
+
+                    {/* Matrix Grid */}
+                    <div style={{ overflowX: "auto" }}>
+                      <table
+                        style={{
+                          width: "100%",
+                          borderCollapse: "collapse",
+                          fontSize: "0.78rem",
+                          textAlign: "center",
+                        }}
+                      >
+                        <thead>
+                          <tr style={{ background: "#e2e8f0" }}>
+                            <th style={{ padding: 6, border: "1px solid #cbd5e1" }}>
+                              Day / Slot
+                            </th>
+                            {activeSlots.map((sl) => (
+                              <th
+                                key={sl}
+                                style={{
+                                  padding: 6,
+                                  border: "1px solid #cbd5e1",
+                                  fontSize: "0.7rem",
+                                }}
+                              >
+                                {sl.split("-")[0]}
+                              </th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {DAYS.map((day) => (
+                            <tr key={day}>
+                              <td
+                                style={{
+                                  padding: 6,
+                                  fontWeight: 700,
+                                  background: "#f1f5f9",
+                                  border: "1px solid #cbd5e1",
+                                }}
+                              >
+                                {day}
+                              </td>
+                              {activeSlots.map((slot) => {
+                                const isBusy = teacherBusyMap[teacher.id]?.has(
+                                  `${day}_${slot}`
+                                );
+
+                                // Robust subject assignment check across all saved timetables
+                                let assignedSubject = null;
+                                const teacherSubNames = linked.map((s) => s.subject_name?.trim().toLowerCase()).filter(Boolean);
+                                const teacherSubCodes = linked.map((s) => s.subject_code?.trim().toLowerCase()).filter(Boolean);
+
+                                for (const tt of allTimetables) {
+                                  const ttJson = tt.timetable_json || {};
+                                  const daySlots = ttJson[day];
+                                  if (!daySlots) continue;
+
+                                  for (const [slotKey, subVal] of Object.entries(daySlots)) {
+                                    if (!subVal || subVal === "-") continue;
+
+                                    const slotMatch =
+                                      slotKey === slot ||
+                                      slotKey.split("-")[0].trim() === slot.split("-")[0].trim();
+
+                                    if (slotMatch) {
+                                      const parts = subVal.includes("/") ? subVal.split("/") : [subVal];
+                                      const isMatch = parts.some((p) => {
+                                        const cleanP = p.trim().toLowerCase();
+                                        return (
+                                          teacherSubNames.some((n) => n === cleanP || cleanP.includes(n) || n.includes(cleanP)) ||
+                                          teacherSubCodes.some((c) => c === cleanP)
+                                        );
+                                      });
+
+                                      if (isMatch) {
+                                        assignedSubject = `${subVal} (${tt.department} S${tt.semester})`;
+                                        break;
+                                      }
+                                    }
+                                  }
+                                  if (assignedSubject) break;
+                                }
+
+                                return (
+                                  <td
+                                    key={slot}
+                                    style={{
+                                      padding: 6,
+                                      border: "1px solid #cbd5e1",
+                                      background: assignedSubject
+                                        ? "#dbeafe"
+                                        : isBusy
+                                        ? "#fecdd3"
+                                        : "#dcfce7",
+                                      color: assignedSubject
+                                        ? "#1e40af"
+                                        : isBusy
+                                        ? "#9f1239"
+                                        : "#166534",
+                                      fontWeight: 600,
+                                      cursor: "pointer",
+                                    }}
+                                    title={
+                                      assignedSubject
+                                        ? `Teaching: ${assignedSubject}`
+                                        : isBusy
+                                        ? "Click to mark Available"
+                                        : "Click to mark Unavailable"
+                                    }
+                                    onClick={() =>
+                                      toggleAvailabilitySlot(
+                                        teacher.id,
+                                        day,
+                                        slot
+                                      )
+                                    }
+                                  >
+                                    {assignedSubject ? (
+                                      <span>📖 {assignedSubject}</span>
+                                    ) : isBusy ? (
+                                      <span>⛔ Blocked</span>
+                                    ) : (
+                                      <span>✓ Free</span>
+                                    )}
+                                  </td>
+                                );
+                              })}
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
               </div>
             );
           })

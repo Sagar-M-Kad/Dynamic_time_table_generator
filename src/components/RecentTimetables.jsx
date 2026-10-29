@@ -262,6 +262,7 @@ const RecentTimetables = () => {
   };
 
   const fetchCourseDetails = async (semester, department) => {
+    const cleanDept = (department || "").replace(/\s*\([^)]*\)/, "").trim();
     const { data, error } = await supabase
       .from("subjects")
       .select(
@@ -278,7 +279,7 @@ const RecentTimetables = () => {
       `
       )
       .eq("semester", semester)
-      .eq("department", department);
+      .eq("department", cleanDept);
 
     if (error) {
       console.error(error);
@@ -311,6 +312,7 @@ const RecentTimetables = () => {
       return teachers.length > 0 ? teachers.join(", ") : "-";
     };
 
+    const cleanDept = (item.department || "").replace(/\s*\([^)]*\)/, "").trim();
     const { data: courseDetails } = await supabase
       .from("subjects")
       .select(
@@ -327,7 +329,7 @@ const RecentTimetables = () => {
         `
       )
       .eq("semester", item.semester)
-      .eq("department", item.department);
+      .eq("department", cleanDept);
 
     if (!tt) return toast.error("No timetable data");
     const tid = toast.loading("Generating PDF…");
@@ -399,25 +401,42 @@ const RecentTimetables = () => {
             continue;
           }
 
-          const val = tt[day]?.[col.label] || "—";
+          const rawVal = tt[day]?.[col.label] || "—";
+          const isLab =
+            (typeof rawVal === "object" && rawVal.is_lab) ||
+            labLabels.has(rawVal);
 
-          // Merge consecutive class slots that share the same lab label
-          if (labLabels.has(val)) {
+          const formattedContent = (cell) => {
+            if (!cell || cell === "-" || cell === "—") return "—";
+            if (typeof cell === "string") return cell;
+            if (cell.batch_labs && cell.batch_labs.length > 0) {
+              return cell.batch_labs
+                .map((bl) => `${bl.batch}: ${bl.subject_name} (${bl.room || "Lab"})`)
+                .join("\n");
+            }
+            if (cell.subject_name) {
+              return cell.room ? `${cell.subject_name} (${cell.room})` : cell.subject_name;
+            }
+            return String(cell);
+          };
+
+          if (isLab) {
             let span = 1;
             let j = i + 1;
             while (
               j < columns.length &&
               columns[j].type === "class" &&
-              (tt[day]?.[columns[j].label] || "—") === val
+              span < 2
             ) {
               span++;
               j++;
             }
 
-            row.push(span > 1 ? { content: val, colSpan: span } : val);
+            const contentText = formattedContent(rawVal);
+            row.push(span > 1 ? { content: contentText, colSpan: span } : contentText);
             i += span;
           } else {
-            row.push(val);
+            row.push(formattedContent(rawVal));
             i++;
           }
         }
@@ -654,6 +673,28 @@ const RecentTimetables = () => {
   const TimetableModal = ({ item, onClose }) => {
     const tt = item.timetable_json || {};
     const colorMap = makeColorMap(tt);
+    const [viewMode, setViewMode] = useState("division"); // 'division' | 'batch' | 'teacher' | 'room'
+    const [selectedBatch, setSelectedBatch] = useState("ALL");
+    const [selectedRoom, setSelectedRoom] = useState("ALL");
+
+    // Extract all unique batch names from timetable
+    const extractedBatches = new Set();
+    Object.values(tt).forEach((daySlots) => {
+      Object.values(daySlots || {}).forEach((cell) => {
+        if (cell && cell.batch_labs) {
+          cell.batch_labs.forEach((bl) => {
+            if (bl.batch) extractedBatches.add(bl.batch);
+          });
+        }
+      });
+    });
+    const batchList = Array.from(extractedBatches).sort();
+
+    // Extract rooms
+    const roomList = [
+      ...(item.theory_room ? [{ name: item.theory_room, type: "Theory" }] : []),
+      ...Object.entries(item.lab_rooms || {}).map(([lab, r]) => ({ name: r, type: lab })),
+    ].filter((r) => r.name && r.name !== "-");
 
     const firstDay = DAYS.find((d) => tt[d]) || DAYS[0];
     const classSlotKeys = [...Object.keys(tt[firstDay] || {})].sort(
@@ -681,26 +722,56 @@ const RecentTimetables = () => {
           continue;
         }
 
-        const subject = tt[day]?.[col.label] || "-";
-        const isLab = labLabels.has(subject);
+        const rawSubject = tt[day]?.[col.label] || "-";
+        const isLab =
+          (typeof rawSubject === "object" && rawSubject.is_lab) ||
+          labLabels.has(rawSubject);
         let span = 1;
 
         if (isLab) {
-          // Count how many consecutive class columns share this value
-          for (let j = i + 1; j < columns.length; j++) {
-            if (columns[j].type !== "class") break;
-            if ((tt[day]?.[columns[j].label] || "-") !== subject) break;
-            span++;
+          span = 2;
+          skipCount = 1;
+        }
+
+        // Apply View Filters
+        let displaySubject = "-";
+        let filteredBatchLabs = null;
+
+        if (typeof rawSubject === "object") {
+          if (rawSubject.batch_labs) {
+            if (viewMode === "batch" && selectedBatch !== "ALL") {
+              const matched = rawSubject.batch_labs.filter((bl) => bl.batch === selectedBatch);
+              filteredBatchLabs = matched;
+              displaySubject = matched.length > 0 ? `${matched[0].batch}: ${matched[0].subject_name} (${matched[0].room || "Lab"})` : "-";
+            } else if (viewMode === "room" && selectedRoom !== "ALL") {
+              const matched = rawSubject.batch_labs.filter((bl) => bl.room === selectedRoom);
+              filteredBatchLabs = matched;
+              displaySubject = matched.length > 0 ? matched.map((m) => `${m.batch}: ${m.subject_name}`).join(" | ") : "-";
+            } else {
+              filteredBatchLabs = rawSubject.batch_labs;
+              displaySubject = rawSubject.batch_labs.map((l) => `${l.batch}: ${l.subject_name}`).join(" | ");
+            }
+          } else {
+            displaySubject = rawSubject.subject_name || "-";
+            if (viewMode === "room" && selectedRoom !== "ALL") {
+              if (item.theory_room !== selectedRoom) displaySubject = "-";
+            }
           }
-          skipCount = span - 1;
+        } else {
+          displaySubject = rawSubject;
+          if (viewMode === "room" && selectedRoom !== "ALL" && displaySubject !== "-") {
+            if (item.theory_room !== selectedRoom) displaySubject = "-";
+          }
         }
 
         cells.push({
           colType: "class",
           label: col.label,
-          subject,
+          subject: displaySubject,
+          batch_labs: filteredBatchLabs,
+          room: rawSubject?.room,
           span,
-          isLab,
+          isLab: isLab && displaySubject !== "-",
         });
       }
       return cells;
@@ -713,7 +784,7 @@ const RecentTimetables = () => {
           <div style={modal.header}>
             <div>
               <h2 style={{ margin: 0 }}>
-                📅 {item.department} | Semester {item.semester}
+                📅 {item.department} | Semester {item.semester} {item.division ? `(${item.division})` : ""}
               </h2>
               <p
                 style={{
@@ -734,7 +805,7 @@ const RecentTimetables = () => {
                   ))}
               </p>
             </div>
-            <div style={{ display: "flex", gap: 10 }}>
+            <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
               <Button
                 variant="outlined"
                 size="small"
@@ -746,6 +817,80 @@ const RecentTimetables = () => {
                 ✕
               </button>
             </div>
+          </div>
+
+          {/* View Mode Toolbar */}
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              marginTop: "14px",
+              padding: "10px 14px",
+              background: "#f8fafc",
+              borderRadius: "8px",
+              border: "1px solid #e2e8f0",
+              flexWrap: "wrap",
+              gap: "10px",
+            }}
+          >
+            <div style={{ display: "flex", gap: "6px" }}>
+              {[
+                { id: "division", label: "Division Master View" },
+                { id: "batch", label: "Batch-Specific View" },
+                { id: "room", label: "Room Utilization View" },
+              ].map((m) => (
+                <button
+                  key={m.id}
+                  onClick={() => setViewMode(m.id)}
+                  style={{
+                    padding: "6px 12px",
+                    borderRadius: "6px",
+                    border: "none",
+                    fontSize: "0.82rem",
+                    fontWeight: 600,
+                    cursor: "pointer",
+                    background: viewMode === m.id ? "#4f46e5" : "#ffffff",
+                    color: viewMode === m.id ? "#ffffff" : "#475569",
+                    boxShadow: viewMode === m.id ? "0 1px 2px rgba(0,0,0,0.1)" : "none",
+                  }}
+                >
+                  {m.label}
+                </button>
+              ))}
+            </div>
+
+            {viewMode === "batch" && (
+              <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                <span style={{ fontSize: "0.82rem", color: "#475569", fontWeight: 600 }}>Filter Batch:</span>
+                <select
+                  value={selectedBatch}
+                  onChange={(e) => setSelectedBatch(e.target.value)}
+                  style={{ padding: "4px 8px", borderRadius: "6px", border: "1px solid #cbd5e1", fontSize: "0.82rem" }}
+                >
+                  <option value="ALL">All Batches</option>
+                  {batchList.map((b) => (
+                    <option key={b} value={b}>{b}</option>
+                  ))}
+                </select>
+              </div>
+            )}
+
+            {viewMode === "room" && (
+              <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                <span style={{ fontSize: "0.82rem", color: "#475569", fontWeight: 600 }}>Filter Room:</span>
+                <select
+                  value={selectedRoom}
+                  onChange={(e) => setSelectedRoom(e.target.value)}
+                  style={{ padding: "4px 8px", borderRadius: "6px", border: "1px solid #cbd5e1", fontSize: "0.82rem" }}
+                >
+                  <option value="ALL">All Rooms</option>
+                  {roomList.map((r, i) => (
+                    <option key={i} value={r.name}>{r.name} ({r.type})</option>
+                  ))}
+                </select>
+              </div>
+            )}
           </div>
 
           {/* Grid */}
@@ -811,7 +956,25 @@ const RecentTimetables = () => {
                               background: colorMap[cell.subject] || "#e0e7ff",
                             }}
                           >
-                            {cell.subject}
+                            {cell.batch_labs && cell.batch_labs.length > 0 ? (
+                              <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                                {cell.batch_labs.map((bl, bIdx) => (
+                                  <div
+                                    key={bIdx}
+                                    style={{
+                                      fontSize: "0.78rem",
+                                      background: "rgba(255,255,255,0.7)",
+                                      padding: "2px 6px",
+                                      borderRadius: 4,
+                                    }}
+                                  >
+                                    <b style={{ color: "#4338ca" }}>{bl.batch}:</b> {bl.subject_name} ({bl.room || "Lab"})
+                                  </div>
+                                ))}
+                              </div>
+                            ) : (
+                              cell.subject
+                            )}
                           </td>
                         );
                       }
@@ -830,7 +993,14 @@ const RecentTimetables = () => {
                           {cell.subject === "-" ? (
                             <span style={{ color: "#cbd5e1" }}>—</span>
                           ) : (
-                            cell.subject
+                            <div>
+                              <div>{cell.subject}</div>
+                              {cell.room && (
+                                <div style={{ fontSize: "0.7rem", color: "#64748b" }}>
+                                  📍 {cell.room}
+                                </div>
+                              )}
+                            </div>
                           )}
                         </td>
                       );

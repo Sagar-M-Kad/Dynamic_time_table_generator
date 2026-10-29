@@ -8,6 +8,10 @@ const SubjectManager = () => {
   const [subjectName, setSubjectName] = useState("");
   const [subjectCode, setSubjectCode] = useState("");
   const [weeklyHours, setWeeklyHours] = useState("");
+  const [courseCategory, setCourseCategory] = useState("Theory");
+  const [ltpLecture, setLtpLecture] = useState("3");
+  const [ltpTutorial, setLtpTutorial] = useState("0");
+  const [ltpPractical, setLtpPractical] = useState("0");
   const [isLab, setIsLab] = useState(false);
   const [semester, setSemester] = useState("1");
   const [department, setDepartment] = useState("ISE");
@@ -15,8 +19,19 @@ const SubjectManager = () => {
   const [expandedDept, setExpandedDept] = useState(null);
   const [expandedSem, setExpandedSem] = useState(null);
 
-  const deptOptions = ["ISE", "CSE", "ECE", "ME", "CV"];
+  const [catalogQuery, setCatalogQuery] = useState("");
+
+  const deptOptions = ["ISE", "CSE", "AIML", "ECE", "ME", "CV"];
   const semOptions = [1, 2, 3, 4, 5, 6, 7, 8];
+  const categoryOptions = [
+    "Theory",
+    "Laboratory",
+    "Tutorial",
+    "Professional Elective",
+    "Open Elective",
+    "Major Project",
+    "Seminar",
+  ];
 
   useEffect(() => {
     fetchSubjects();
@@ -38,17 +53,47 @@ const SubjectManager = () => {
     if (!subjectName || !subjectCode || !weeklyHours)
       return toast.error("Please fill in Subject Name, Code and Credits.");
 
+    const cleanCode = subjectCode.toUpperCase().trim();
+    const cleanName = subjectName.trim();
+    const semNum = parseInt(semester);
+
+    // Prevent duplicate course creation
+    const duplicate = subjects.find(
+      (s) =>
+        s.subject_code?.toUpperCase().trim() === cleanCode &&
+        s.department?.toUpperCase() === department.toUpperCase() &&
+        parseInt(s.semester) === semNum
+    );
+    if (duplicate) {
+      return toast.error(
+        `Course "${cleanCode}" already exists for ${department} Sem ${semester}.`
+      );
+    }
+
     const tid = toast.loading("Saving subject...");
-    const { error } = await supabase.from("subjects").insert([
-      {
-        subject_name: subjectName,
-        subject_code: subjectCode.toUpperCase().trim(),
-        weekly_hours: parseFloat(weeklyHours),
-        is_lab: isLab,
-        semester: parseInt(semester),
-        department,
-      },
-    ]);
+    const isLabActual = isLab || courseCategory === "Laboratory";
+    const ltpString = `${ltpLecture || 0}-${ltpTutorial || 0}-${ltpPractical || (isLabActual ? 2 : 0)}`;
+
+    const insertPayload = {
+      subject_name: cleanName,
+      subject_code: cleanCode,
+      weekly_hours: parseFloat(weeklyHours),
+      is_lab: isLabActual,
+      semester: parseInt(semester),
+      department,
+      course_category: courseCategory,
+      ltp: ltpString,
+    };
+
+    let { error } = await supabase.from("subjects").insert([insertPayload]);
+
+    // Graceful fallback if course_category or ltp columns don't exist yet in Supabase table
+    if (error && (error.message.includes("course_category") || error.message.includes("ltp"))) {
+      delete insertPayload.course_category;
+      delete insertPayload.ltp;
+      const retry = await supabase.from("subjects").insert([insertPayload]);
+      error = retry.error;
+    }
 
     if (error) {
       toast.error(error.message || "Failed to save", { id: tid });
@@ -57,8 +102,9 @@ const SubjectManager = () => {
       setSubjectCode("");
       setWeeklyHours("");
       setIsLab(false);
+      setCourseCategory("Theory");
       fetchSubjects();
-      toast.success("Subject added!", { id: tid });
+      toast.success("Subject added with complete metadata!", { id: tid });
     }
   };
 
@@ -185,6 +231,65 @@ const SubjectManager = () => {
           </div>
         </div>
 
+        {/* Row 3 — Category + L-T-P breakdown */}
+        <div className="room-form-grid" style={{ marginTop: "20px" }}>
+          <div className="form-group">
+            <label style={{ color: "#475569", fontWeight: "600" }}>
+              Course Category / Classification
+            </label>
+            <select
+              value={courseCategory}
+              onChange={(e) => {
+                const cat = e.target.value;
+                setCourseCategory(cat);
+                if (cat === "Laboratory") setIsLab(true);
+              }}
+              style={inp}
+            >
+              {categoryOptions.map((c) => (
+                <option key={c} value={c}>
+                  {c}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div className="form-group">
+            <label style={{ color: "#475569", fontWeight: "600" }}>
+              L-T-P (Lecture - Tutorial - Practical)
+            </label>
+            <div style={{ display: "flex", gap: "8px", marginTop: "5px" }}>
+              <input
+                type="number"
+                min="0"
+                value={ltpLecture}
+                onChange={(e) => setLtpLecture(e.target.value)}
+                placeholder="L"
+                title="Lecture Hours"
+                style={{ ...inp, marginTop: 0 }}
+              />
+              <input
+                type="number"
+                min="0"
+                value={ltpTutorial}
+                onChange={(e) => setLtpTutorial(e.target.value)}
+                placeholder="T"
+                title="Tutorial Hours"
+                style={{ ...inp, marginTop: 0 }}
+              />
+              <input
+                type="number"
+                min="0"
+                value={ltpPractical}
+                onChange={(e) => setLtpPractical(e.target.value)}
+                placeholder="P"
+                title="Practical/Lab Hours"
+                style={{ ...inp, marginTop: 0 }}
+              />
+            </div>
+          </div>
+        </div>
+
         {/* Lab checkbox */}
         <div
           style={{
@@ -197,7 +302,7 @@ const SubjectManager = () => {
           <input
             type="checkbox"
             id="labCheck"
-            checked={isLab}
+            checked={isLab || courseCategory === "Laboratory"}
             onChange={(e) => setIsLab(e.target.checked)}
             style={{
               width: 18,
@@ -210,7 +315,7 @@ const SubjectManager = () => {
             htmlFor="labCheck"
             style={{ color: "#475569", cursor: "pointer", fontWeight: 600 }}
           >
-            Practical / Lab Subject
+            Requires Dedicated Laboratory (Consecutive 2-Hour Window)
           </label>
         </div>
 
@@ -231,9 +336,57 @@ const SubjectManager = () => {
 
       {/* ── CATALOG ── */}
       <div className="list">
-        <h3 style={{ color: "#0f172a", marginBottom: "20px" }}>
-          Academic Catalog
-        </h3>
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            flexWrap: "wrap",
+            gap: 12,
+            marginBottom: "20px",
+          }}
+        >
+          <div>
+            <h3 style={{ color: "#0f172a", margin: 0 }}>Academic Catalog</h3>
+            <span style={{ fontSize: "0.82rem", color: "#64748b" }}>
+              {subjects.length} Canonical Courses Configured
+            </span>
+          </div>
+
+          <div style={{ position: "relative", minWidth: 280 }}>
+            <input
+              type="text"
+              placeholder="Search catalog by code or title…"
+              value={catalogQuery}
+              onChange={(e) => setCatalogQuery(e.target.value)}
+              style={{
+                width: "100%",
+                padding: "8px 12px",
+                borderRadius: 8,
+                border: "1px solid #cbd5e1",
+                fontSize: "0.88rem",
+              }}
+            />
+            {catalogQuery && (
+              <button
+                type="button"
+                onClick={() => setCatalogQuery("")}
+                style={{
+                  position: "absolute",
+                  right: 8,
+                  top: "50%",
+                  transform: "translateY(-50%)",
+                  border: "none",
+                  background: "none",
+                  cursor: "pointer",
+                  color: "#94a3b8",
+                }}
+              >
+                ✕
+              </button>
+            )}
+          </div>
+        </div>
 
         {loading
           ? [1, 2, 3, 4, 5].map((i) => (
@@ -249,10 +402,16 @@ const SubjectManager = () => {
               />
             ))
           : deptOptions.map((dept) => {
-              const isDeptOpen = expandedDept === dept;
-              const deptSubjects = subjects.filter(
-                (s) => s.department === dept
-              );
+              const q = catalogQuery.trim().toLowerCase();
+              const deptSubjects = subjects.filter((s) => {
+                if (s.department !== dept) return false;
+                if (!q) return true;
+                return (
+                  s.subject_code?.toLowerCase().includes(q) ||
+                  s.subject_name?.toLowerCase().includes(q)
+                );
+              });
+              const isDeptOpen = expandedDept === dept || (q.length > 0 && deptSubjects.length > 0);
               return (
                 <div
                   key={dept}
@@ -291,10 +450,12 @@ const SubjectManager = () => {
                     <div style={{ padding: 12, background: "#f8fafc" }}>
                       {semOptions.map((sem) => {
                         const semKey = `${dept}-${sem}`;
-                        const isSemOpen = expandedSem === semKey;
                         const finalSubjects = deptSubjects.filter(
                           (s) => s.semester === sem
                         );
+                        const isSemOpen =
+                          expandedSem === semKey ||
+                          (catalogQuery.trim().length > 0 && finalSubjects.length > 0);
                         return (
                           <div
                             key={sem}
@@ -390,6 +551,35 @@ const SubjectManager = () => {
                                           >
                                             {sub.subject_code || "—"}
                                           </span>
+                                          {sub.course_category && (
+                                            <span
+                                              style={{
+                                                backgroundColor: "#ede9fe",
+                                                color: "#5b21b6",
+                                                padding: "2px 8px",
+                                                borderRadius: 6,
+                                                fontSize: "0.68rem",
+                                                fontWeight: 600,
+                                              }}
+                                            >
+                                              {sub.course_category}
+                                            </span>
+                                          )}
+                                          {sub.ltp && (
+                                            <span
+                                              style={{
+                                                backgroundColor: "#f1f5f9",
+                                                color: "#334155",
+                                                padding: "2px 6px",
+                                                borderRadius: 4,
+                                                fontSize: "0.68rem",
+                                                fontWeight: 600,
+                                                letterSpacing: "0.5px",
+                                              }}
+                                            >
+                                              L-T-P: {sub.ltp}
+                                            </span>
+                                          )}
                                           {sub.is_lab && (
                                             <span
                                               style={{

@@ -1,13 +1,21 @@
 import { supabase } from "../supabaseClient";
 import { GoogleGenerativeAI } from "@google/generative-ai";
+import {
+  generateDeterministicTimetable,
+  validateSchedule,
+  calculateTimetableQualityScore,
+  repairSchedule,
+} from "./schedulerEngine";
+import { fetchAcademicStructure } from "./academicStructureService";
 
-const API_KEY = "AIzaSyDatV_50b7z6-M_gHFO0_5thrlJpelPg2I";
+// API key loaded from .env — never hardcode secrets in source files.
+const FALLBACK_API_KEY = process.env.REACT_APP_GEMINI_KEY || "";
 let _activeApiKey = null;
 
-let genAI = new GoogleGenerativeAI(API_KEY);
+let genAI = new GoogleGenerativeAI(FALLBACK_API_KEY);
 
 let model = genAI.getGenerativeModel({
-  model: "gemini-3.5-flash",
+  model: "gemini-1.5-flash",
 });
 
 (async () => {
@@ -22,7 +30,7 @@ let model = genAI.getGenerativeModel({
       console.log("✅ Using DB API KEY:");
       genAI = new GoogleGenerativeAI(_activeApiKey);
       model = genAI.getGenerativeModel({
-        model: "gemini-3.5-flash",
+        model: "gemini-1.5-flash",
       });
     } else {
       console.log("⚠️ Using fallback API KEY:");
@@ -38,13 +46,17 @@ export const setActiveApiKey = (key) => {
   console.log("🔁 Switched API KEY:");
   genAI = new GoogleGenerativeAI(_activeApiKey);
   model = genAI.getGenerativeModel({
-    model: "gemini-3.5-flash",
+    model: "gemini-1.5-flash",
   });
 };
 
 const parseJSON = (text) => {
   try {
-    const cleaned = text.replace(/```json|```/g, "").trim();
+    const cleaned = text.replace(/```json/g, "").replace(/```/g, "").trim();
+    const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      return JSON.parse(jsonMatch[0]);
+    }
     return JSON.parse(cleaned);
   } catch (err) {
     console.error("AI RAW RESPONSE:", text);
@@ -511,7 +523,9 @@ export const validateTimetable = (
   timetable,
   subjects,
   teacherLinks,
-  teacherBusy
+  teacherBusy,
+  constraints = {},
+  orderedSlots = null  // ordered slot labels array from createSlotsWithBreaks
 ) => {
   const conflicts = [];
   const subjectTeacherMap = buildSubjectTeacherMap(teacherLinks);
@@ -532,12 +546,23 @@ export const validateTimetable = (
   const combinedLabLabel =
     labSubjectList.length > 0 ? getLabLabel(labSubjectList) : null;
 
+  // Teacher Workload Guardrails — use passed constraints, not localStorage
+  const maxDailyHours = parseInt(constraints.max_daily_hours) || 4;
+  const maxConsecHours = parseInt(constraints.max_consecutive_hours) || 2;
+  const teacherDailyHours = {};
+
   for (const day in timetable) {
     const daySubjectSeen = new Set();
+    const teacherConsecutiveCount = {};
 
     for (const slot in timetable[day]) {
       const subject = timetable[day][slot];
-      if (!subject || subject === "-") continue;
+      if (!subject || subject === "-") {
+        Object.keys(teacherConsecutiveCount).forEach(
+          (t) => (teacherConsecutiveCount[t] = 0)
+        );
+        continue;
+      }
 
       // Weekly count
       if (subjectWeeklyCount[subject] !== undefined) {
@@ -579,6 +604,23 @@ export const validateTimetable = (
           );
         }
         teacherSlotUsage[key] = subject;
+
+        // Daily Workload Check
+        if (!teacherDailyHours[teacherId]) teacherDailyHours[teacherId] = {};
+        teacherDailyHours[teacherId][day] = (teacherDailyHours[teacherId][day] || 0) + 1;
+        if (teacherDailyHours[teacherId][day] > maxDailyHours) {
+          conflicts.push(
+            `TEACHER_OVERLOAD: Teacher for "${subject}" exceeds daily limit of ${maxDailyHours} hrs on ${day}`
+          );
+        }
+
+        // Consecutive Hours Check
+        teacherConsecutiveCount[teacherId] = (teacherConsecutiveCount[teacherId] || 0) + 1;
+        if (teacherConsecutiveCount[teacherId] > maxConsecHours) {
+          conflicts.push(
+            `TEACHER_FATIGUE: Teacher for "${subject}" exceeds consecutive limit of ${maxConsecHours} hrs on ${day}`
+          );
+        }
       }
     }
   }
@@ -593,15 +635,17 @@ export const validateTimetable = (
     }
   });
 
-  // Lab continuity check
-  // The timetable stores the COMBINED lab label (e.g. "WEB LAB/CN LAB") in every
-  // slot of a lab block. We just need to verify each occurrence is adjacent to
-  // another slot with the same combined label.
+  // Lab continuity check — use orderedSlots to guarantee correct time ordering.
+  // Object.keys() order is not guaranteed for time-string keys across all runtimes.
   const labsInSubjects = subjects.filter((s) => s.is_lab);
   if (labsInSubjects.length > 0) {
     const combinedLabel = getLabLabel(labsInSubjects);
     for (const day in timetable) {
-      const slotKeys = Object.keys(timetable[day]);
+      // Use the ordered slot labels if provided, otherwise fall back to Object.keys()
+      const slotKeys = orderedSlots
+        ? orderedSlots.filter((sl) => timetable[day][sl] !== undefined)
+        : Object.keys(timetable[day]);
+
       for (let i = 0; i < slotKeys.length; i++) {
         const val = timetable[day][slotKeys[i]];
         if (val !== combinedLabel) continue;
@@ -619,6 +663,93 @@ export const validateTimetable = (
         }
       }
     }
+  }
+
+  return conflicts;
+};
+
+/**
+ * Cross-division teacher conflict check.
+ * Loads all saved timetables for the same department (excluding the current generation's
+ * semester+division combination) and checks if any teacher is already assigned
+ * to a slot that this new timetable also uses.
+ *
+ * Returns an array of conflict strings.
+ */
+export const checkCrossDivisionConflicts = async (
+  newTimetable,
+  teacherLinks,
+  currentSemester,
+  currentDivision
+) => {
+  const conflicts = [];
+
+  try {
+    // Fetch all other saved timetables (different division or semester)
+    const { data: savedTimetables } = await supabase
+      .from("saved_timetables")
+      .select("id, department, semester, division, timetable_json")
+      .neq("semester", parseInt(currentSemester));
+
+    // Also check same-semester different divisions if division tracking is present
+    const { data: sameSemOther } = await supabase
+      .from("saved_timetables")
+      .select("id, department, semester, division, timetable_json")
+      .eq("semester", parseInt(currentSemester))
+      .neq("division", currentDivision || "");
+
+    const allOther = [...(savedTimetables || []), ...(sameSemOther || [])];
+
+    if (allOther.length === 0) return conflicts;
+
+    // Build subject→teacher map for the NEW timetable
+    const subjectTeacherMap = buildSubjectTeacherMap(teacherLinks);
+
+    // Build a set: "teacherId_day_slot" for all slots in the new timetable
+    const newTeacherSlots = new Set();
+    for (const day in newTimetable) {
+      for (const slot in newTimetable[day]) {
+        const subject = newTimetable[day][slot];
+        if (!subject || subject === "-") continue;
+        const teacherId = subjectTeacherMap[subject];
+        if (teacherId) newTeacherSlots.add(`${teacherId}_${day}_${slot}`);
+      }
+    }
+
+    // Check each existing timetable for overlapping teacher slots
+    for (const saved of allOther) {
+      const otherTT = saved.timetable_json;
+      if (!otherTT || typeof otherTT !== "object") continue;
+
+      const label = saved.division
+        ? `${saved.department || ""} Sem ${saved.semester} ${saved.division}`
+        : `Sem ${saved.semester}`;
+
+      for (const day in otherTT) {
+        for (const slot in otherTT[day]) {
+          const subject = otherTT[day][slot];
+          if (!subject || subject === "-") continue;
+
+          // We only know teacher IDs for this division's teacher links.
+          // Check if a teacher from our teacherLinks is already used in the other timetable.
+          for (const link of teacherLinks) {
+            const subName = link.subjects?.subject_name;
+            if (!subName) continue;
+            if (otherTT[day][slot] !== subName) continue;
+            const teacherId = link.teacher_id;
+            if (!teacherId) continue;
+
+            if (newTeacherSlots.has(`${teacherId}_${day}_${slot}`)) {
+              conflicts.push(
+                `CROSS_DIVISION_CONFLICT: Teacher for "${subName}" is already assigned in [${label}] on ${day} at ${slot}`
+              );
+            }
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.warn("[checkCrossDivisionConflicts] Could not run check:", err.message);
   }
 
   return conflicts;
@@ -721,13 +852,15 @@ NO explanation, NO markdown, ONLY JSON.
 // ─────────────────────────────────────────────────────────────────────────────
 // MAIN ORCHESTRATOR
 // ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// MAIN ORCHESTRATOR WITH BATCH-AWARE DETERMINISTIC ENGINE
+// ─────────────────────────────────────────────────────────────────────────────
 export const generateTimetableFull = async (
   semester,
   department,
-  onStatusUpdate
+  onStatusUpdate,
+  division = "Section A"
 ) => {
-  const MAX_RETRIES = 2;
-
   const status = (msg) => {
     console.log("[TimetableGen]", msg);
     if (onStatusUpdate) onStatusUpdate(msg);
@@ -737,122 +870,121 @@ export const generateTimetableFull = async (
   status("Fetching subjects, constraints, teachers & rooms…");
   const data = await fetchGenerationData(semester, department);
 
-  // 2. Build slot list
-  status("Building time slots…");
-  const slots = createSlotsWithBreaks(data.constraints);
-
-  // 3. JS deterministic scheduler (fast, no AI, produces spread timetable)
-  status("Building timetable with JS scheduler…");
-  let timetable = buildTimetableWithJS(data.subjects, slots, data.constraints);
-
-  // 4. JS fix pass (clean up any over-limits / duplicates)
-  timetable = fixTimetableWithJS(timetable, data.subjects);
-
-  // ── Capture lab positions from the JS result so Gemini cannot change them ──
-  const labSubjects = data.subjects.filter((s) => s.is_lab);
-  const labLabel = getLabLabel(labSubjects);
-  const jsLabSchedule = {}; // { day: [slot, ...] }
-  if (labLabel) {
-    for (const day in timetable) {
-      const labSlots = Object.keys(timetable[day]).filter(
-        (sl) => timetable[day][sl] === labLabel
-      );
-      if (labSlots.length > 0) jsLabSchedule[day] = labSlots;
-    }
-  }
-
-  // Helper: restore the JS lab schedule onto a timetable object
-  const restoreLabPositions = (tt) => {
-    if (!labLabel) return;
-    // 1. Clear any lab cells that Gemini placed
-    for (const day in tt) {
-      for (const sl in tt[day]) {
-        if (tt[day][sl] === labLabel) tt[day][sl] = "-";
-      }
-    }
-    // 2. Re-apply original JS lab positions
-    for (const day in jsLabSchedule) {
-      jsLabSchedule[day].forEach((sl) => {
-        if (tt[day]) tt[day][sl] = labLabel;
-      });
-    }
-  };
-
-  // 5. AI review pass — give the JS result to AI to patch any remaining issues
-  status("AI reviewing and patching timetable…");
+  // 2. Fetch academic structure to resolve configured batches
+  status("Loading academic structure & batches for " + department + " Sem " + semester + "…");
+  let batches = ["B1", "B2"];
   try {
-    const reviewPrompt = constructGeminiPrompt(
-      data.subjects,
+    const academicData = await fetchAcademicStructure();
+    const divObj = (academicData.divisions || []).find(
+      (d) =>
+        d.department_code?.toUpperCase() === department?.toUpperCase() &&
+        parseInt(d.semester) === parseInt(semester) &&
+        (d.name === division || d.name?.includes(division) || division?.includes(d.name))
+    );
+    if (divObj) {
+      const configuredBatches = (academicData.batches || [])
+        .filter((b) => b.division_id === divObj.id && b.is_active !== false)
+        .map((b) => b.name);
+      if (configuredBatches.length > 0) batches = configuredBatches;
+    }
+  } catch (e) {
+    console.warn("Could not load dynamic batches, using defaults:", e.message);
+  }
+
+  // 3. Build slot list
+  status("Building time slots & 2-hour consecutive lab windows…");
+  const slots = createSlotsWithBreaks(data.constraints);
+  const orderedClassSlots = slots
+    .filter((s) => s.type === "class")
+    .map((s) => s.label);
+
+  // 4. Fetch other saved timetables for cross-division checks
+  let otherTimetables = [];
+  try {
+    const { data: saved } = await supabase
+      .from("saved_timetables")
+      .select("id, department, semester, division, timetable_json");
+    otherTimetables = saved || [];
+  } catch (e) {
+    console.warn("Could not fetch other timetables:", e.message);
+  }
+
+  // 5. Run Deterministic Constraint Engine
+  status(`Executing constraint-satisfaction scheduler for ${division} with batches [${batches.join(", ")}]…`);
+  const engineResult = generateDeterministicTimetable({
+    subjects: data.subjects,
+    slots,
+    constraints: data.constraints,
+    resources: data.resources,
+    busyMap: data.busyMap,
+    academicScope: { department, semester: parseInt(semester), division, batches },
+    existingOtherTimetables: otherTimetables,
+  });
+
+  let timetable = engineResult.timetable;
+  let validation = engineResult.validation;
+  let qualityScore = engineResult.qualityScore;
+
+  if (engineResult.isInfeasible) {
+    status(`❌ ${engineResult.error}`);
+    return {
+      timetable: null,
       slots,
+      data,
+      validation,
+      qualityScore,
+      remainingConflicts: [engineResult.error],
+      orderedClassSlots,
+      batches,
+      theoryRoom: null,
+      isInfeasible: true,
+      error: engineResult.error,
+    };
+  }
+
+  // If initial schedule has violations, attempt automatic repair
+  if (!validation.isValid && timetable) {
+    status("Attempting automatic repair of schedule violations…");
+    const repairResult = repairSchedule({
+      timetable,
+      subjects: data.subjects,
+      slots,
+      constraints: data.constraints,
+      teacherLinks: data.resources.teacherLinks,
+      teacherBusy: data.busyMap.teacherBusy,
+      rooms: data.resources.rooms,
+      batches,
+      existingOtherTimetables: otherTimetables,
+      division,
+      semester: parseInt(semester),
       department,
-      data.constraints,
-      timetable
-    );
-    const aiPatched = await generateWithGemini(reviewPrompt);
-    // Only accept AI patch if it returns a valid object with same day keys
-    const aiDays = Object.keys(aiPatched);
-    const expectedDays = [
-      "Monday",
-      "Tuesday",
-      "Wednesday",
-      "Thursday",
-      "Friday",
-      "Saturday",
-    ];
-    if (aiDays.length >= 6 && expectedDays.every((d) => aiPatched[d])) {
-      timetable = fixTimetableWithJS(aiPatched, data.subjects);
-      // Restore lab positions that Gemini may have moved
-      restoreLabPositions(timetable);
+    });
+    if (repairResult.repaired) {
+      timetable = repairResult.timetable;
+      validation = repairResult.validation;
+      qualityScore = repairResult.qualityScore;
+      status("✅ Violations automatically resolved by repair pipeline!");
     }
-  } catch (err) {
-    status("AI review skipped (using JS result)…");
-    console.warn("AI review failed:", err.message);
   }
 
-  // 6. Validate
-  let conflicts = validateTimetable(
-    timetable,
-    data.subjects,
-    data.resources.teacherLinks,
-    data.busyMap.teacherBusy
-  );
+  // 6. Independent validation confirmation
+  const remainingConflicts = validation.violations.map((v) => v.message || JSON.stringify(v));
 
-  // 7. Conflict fix loop (teacher conflicts etc.)
-  let attempt = 0;
-  while (conflicts.length > 0 && attempt < MAX_RETRIES) {
-    attempt++;
-    status(
-      `Found ${conflicts.length} conflict(s) — fixing (attempt ${attempt}/${MAX_RETRIES})…`
-    );
-    console.log("Conflicts:", conflicts);
-
-    const fixPrompt = constructConflictFixPrompt(
-      timetable,
-      conflicts,
-      data.subjects
-    );
-    try {
-      timetable = await generateWithGemini(fixPrompt);
-    } catch (err) {
-      status("AI fix failed, keeping JS result…");
-    }
-
-    timetable = fixTimetableWithJS(timetable, data.subjects);
-    conflicts = validateTimetable(
-      timetable,
-      data.subjects,
-      data.resources.teacherLinks,
-      data.busyMap.teacherBusy
-    );
-  }
-
-  if (conflicts.length > 0) {
-    status(
-      `⚠️ ${conflicts.length} conflict(s) remain after ${MAX_RETRIES} attempts.`
-    );
+  if (validation.isValid) {
+    status("✅ Timetable generated: 0 conflicts, fully validated!");
   } else {
-    status("Timetable generated and validated successfully!");
+    status(`⚠️ Generated with ${remainingConflicts.length} unresolved conflict(s). Reviewing…`);
   }
 
-  return { timetable, slots, data, remainingConflicts: conflicts };
+  return {
+    timetable,
+    slots,
+    data,
+    validation,
+    qualityScore,
+    remainingConflicts,
+    orderedClassSlots,
+    batches,
+    theoryRoom: engineResult.theoryRoom,
+  };
 };

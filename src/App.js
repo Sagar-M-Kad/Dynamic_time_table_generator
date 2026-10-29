@@ -5,6 +5,7 @@ import TeacherManager from "./components/TeacherManager";
 import RoomManager from "./components/RoomManager";
 import SubjectManager from "./components/SubjectManager";
 import ConstraintManager from "./components/ConstraintManager";
+import AcademicStructureManager from "./components/AcademicStructureManager";
 import LiveStatus from "./components/LiveStatus";
 import RecentTimetables from "./components/RecentTimetables";
 import Login from "./components/Login";
@@ -67,6 +68,8 @@ function App() {
         return <GenerateAI />;
       case "recent":
         return <RecentTimetables />;
+      case "academic":
+        return <AcademicStructureManager />;
       case "teachers":
         return <TeacherManager />;
       case "rooms":

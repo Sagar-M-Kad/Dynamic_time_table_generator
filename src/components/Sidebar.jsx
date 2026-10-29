@@ -9,6 +9,7 @@ import {
   BookOpen,
   Settings2,
   X,
+  FolderTree,
   Settings,
 } from "lucide-react";
 
@@ -20,9 +21,10 @@ const Sidebar = ({ activePage, setActivePage, onLogout, isOpen, onClose }) => {
   ];
 
   const manageItems = [
+    { id: "academic", label: "Academic Structure", icon: FolderTree },
     { id: "teachers", label: "Teachers", icon: Users },
     { id: "rooms", label: "Rooms", icon: School },
-    { id: "subjects", label: "Subjects", icon: BookOpen },
+    { id: "subjects", label: "Subjects & Electives", icon: BookOpen },
     { id: "constraints", label: "Constraints", icon: Settings2 },
     { id: "settings", label: "Settings", icon: Settings },
   ];

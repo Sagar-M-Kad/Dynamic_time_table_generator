@@ -45,20 +45,39 @@ const Settings = () => {
     e.preventDefault();
     if (!name.trim() || !apiKey.trim())
       return toast.error("Please fill in both name and API key.");
-    if (!apiKey.trim().startsWith("AIza"))
-      return toast.error("That doesn't look like a valid Gemini API key.");
+    if (apiKey.trim().length < 5)
+      return toast.error("Please enter a valid API key.");
 
     setAdding(true);
-    const { error } = await supabase
-      .from("api_keys")
-      .insert([
-        { name: name.trim(), api_key: apiKey.trim(), is_active: false },
-      ]);
+
+    // Auto-activate if no key is currently active
+    const hasActiveKey = keys.some((k) => k.is_active);
+    const shouldMakeActive = !hasActiveKey;
+
+    if (shouldMakeActive) {
+      await supabase
+        .from("api_keys")
+        .update({ is_active: false })
+        .eq("is_active", true);
+    }
+
+    const { error } = await supabase.from("api_keys").insert([
+      {
+        name: name.trim(),
+        api_key: apiKey.trim(),
+        is_active: shouldMakeActive,
+      },
+    ]);
 
     if (error) {
       toast.error("Failed to save: " + error.message);
     } else {
-      toast.success(`API key "${name.trim()}" saved!`);
+      if (shouldMakeActive) {
+        setActiveApiKey(apiKey.trim());
+        toast.success(`API key "${name.trim()}" saved and set as active!`);
+      } else {
+        toast.success(`API key "${name.trim()}" saved!`);
+      }
       setName("");
       setApiKey("");
       fetchKeys();
@@ -71,8 +90,11 @@ const Settings = () => {
     if (key.is_active) return; // already active
     setSelectingId(key.id);
 
-    // Deactivate all keys first
-    await supabase.from("api_keys").update({ is_active: false }).neq("id", 0);
+    // Deactivate all active keys first
+    await supabase
+      .from("api_keys")
+      .update({ is_active: false })
+      .eq("is_active", true);
 
     // Activate chosen key
     const { error } = await supabase
@@ -107,8 +129,12 @@ const Settings = () => {
     setDeletingId(null);
   };
 
-  // Mask key for display
-  const maskKey = (k) => k.slice(0, 8) + "••••••••••••••••" + k.slice(-4);
+  // Mask key for display safely regardless of length or prefix
+  const maskKey = (k) => {
+    if (!k) return "";
+    if (k.length <= 12) return k.slice(0, 3) + "••••••••" + (k.length > 3 ? k.slice(-2) : "");
+    return k.slice(0, 8) + "••••••••••••••••" + k.slice(-4);
+  };
 
   const activeKey = keys.find((k) => k.is_active);
 
@@ -166,7 +192,7 @@ const Settings = () => {
             <div style={{ position: "relative" }}>
               <input
                 type={showKey ? "text" : "password"}
-                placeholder="AIza..."
+                placeholder="Enter API key..."
                 value={apiKey}
                 onChange={(e) => setApiKey(e.target.value)}
                 style={{
