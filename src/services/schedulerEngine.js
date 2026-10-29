@@ -64,6 +64,217 @@ export const getConsecutiveLabWindows = (fullSlots, labDurationHours = 2) => {
   return windows;
 };
 
+// ── 1B. PARALLEL ELECTIVE BASKET SYNTHESIZER ─────────────────────────────────
+export const synthesizeElectiveGroupsAndOfferings = ({
+  subjects = [],
+  academicScope = {},
+  electiveGroups = null,
+  courseOfferings = null,
+  resources = {},
+}) => {
+  const department = academicScope.department || "CSE";
+  const semester = parseInt(academicScope.semester) || 7;
+  const teacherLinks = resources.teacherLinks || [];
+  const rooms = resources.rooms || [];
+
+  const theoryRooms = rooms.filter(
+    (r) => !r.is_lab && !r.room_name?.toLowerCase().includes("lab")
+  );
+  const primaryTheoryRoom = theoryRooms[0]?.room_name || "Room-22";
+  const seminarRoom =
+    theoryRooms.find((r) => r.room_name?.toLowerCase().includes("seminar"))?.room_name ||
+    theoryRooms[1]?.room_name ||
+    "CSE Seminar Hall";
+
+  const defaultRoomsList = [primaryTheoryRoom, seminarRoom, "Room-23", "CSE Seminar Hall-2"];
+
+  const subjectTeacherMap = {};
+  teacherLinks.forEach((tl) => {
+    const name = tl.subjects?.subject_name;
+    if (name) {
+      subjectTeacherMap[name.trim().toLowerCase()] =
+        tl.teachers?.name || tl.teacher_id;
+    }
+  });
+
+  // Faculty curriculum fallbacks (matching SDMCET / autonomous VII sem official allocation)
+  const facultyFallbacks = {
+    "distributed systems and applications": "Dr. S G Yadawad",
+    "distrubuted systems and applications": "Dr. S G Yadawad",
+    "distributed systems": "Dr. S G Yadawad",
+    "natural language processing": "Prof Radhika Amashi",
+    "natural processing language": "Prof Radhika Amashi",
+    "deep learning and applications": "Prof Pratapkumar M K",
+    "deep learning": "Prof Pratapkumar M K",
+    "software testing": "Dr. S B Kulkarni",
+    "cryptography and network security": "Dr. Sandhya S V",
+    "blockchain technology": "Prof Anand S P",
+  };
+
+  // Map to cluster subjects into elective groups
+  const electiveClusterMap = new Map();
+
+  const registerElective = (clusterKey, groupName, weeklyHours, sub) => {
+    if (!electiveClusterMap.has(clusterKey)) {
+      electiveClusterMap.set(clusterKey, {
+        groupId: `elec-${department.toLowerCase()}-${semester}-${clusterKey.toLowerCase()}`,
+        groupName,
+        weeklyHours: weeklyHours || sub.weekly_hours || 3,
+        subjects: [],
+      });
+    }
+    const cluster = electiveClusterMap.get(clusterKey);
+    const sNorm = (sub.subject_name || "").trim().toLowerCase();
+    if (!cluster.subjects.some((s) => (s.subject_name || "").trim().toLowerCase() === sNorm)) {
+      cluster.subjects.push(sub);
+    }
+  };
+
+  subjects.forEach((s) => {
+    if (s.is_lab) return; // Lab subjects are handled in batch-lab pipeline
+    const nameNorm = (s.subject_name || "").trim().toLowerCase();
+    const code = (s.subject_code || "").trim().toUpperCase();
+    const grpId = (s.elective_group_id || "").trim();
+
+    // 1. Explicit elective_group_id specified by user in UI
+    if (grpId) {
+      const cleanGrp = grpId.toUpperCase();
+      registerElective(cleanGrp, `Professional Elective (${cleanGrp})`, s.weekly_hours, s);
+      return;
+    }
+
+    // 2. Known elective subject pairs (as specified by user & official curriculum)
+    const isDistributed =
+      nameNorm.includes("distr") && (nameNorm.includes("system") || nameNorm.includes("app"));
+    const isNLP =
+      (nameNorm.includes("natural") && (nameNorm.includes("language") || nameNorm.includes("process"))) ||
+      nameNorm.includes("nlp");
+    if (isDistributed || isNLP) {
+      registerElective("PE-1", "Professional Elective - I (Distributed Systems / NLP)", 3, s);
+      return;
+    }
+
+    const isDeepLearning = nameNorm.includes("deep") && nameNorm.includes("learn");
+    const isSoftwareTesting = nameNorm.includes("software") && nameNorm.includes("test");
+    if (isDeepLearning || isSoftwareTesting) {
+      registerElective("PE-2", "Professional Elective - II (Deep Learning / Software Testing)", 3, s);
+      return;
+    }
+
+    // 3. Subject code matching elective pattern (e.g., 22UCSE72x vs 22UCSE73x)
+    const electiveCodeMatch =
+      code.match(/^([A-Z0-9]+[A-Z]+E\d{2})/i) || code.match(/^(\d{2}[A-Z]+E\d{2})/i);
+    if (electiveCodeMatch) {
+      const prefix = electiveCodeMatch[1].toUpperCase();
+      registerElective(prefix, `Elective Group (${prefix})`, s.weekly_hours, s);
+    }
+  });
+
+  const synthesizedGroups = [];
+  const synthesizedOfferings = [];
+  const electiveSubjectNorms = new Set();
+
+  electiveClusterMap.forEach((cluster) => {
+    if (cluster.subjects.length > 0) {
+      const grp = {
+        id: cluster.groupId,
+        department_code: department,
+        semester: semester,
+        name: cluster.groupName,
+        type: "parallel",
+        weekly_hours: cluster.weeklyHours,
+        description: `Parallel elective basket: ${cluster.subjects.map((s) => s.subject_name).join(", ")}`,
+        created_at: new Date().toISOString(),
+      };
+      synthesizedGroups.push(grp);
+
+      cluster.subjects.forEach((sub, idx) => {
+        const sNorm = (sub.subject_name || "").trim().toLowerCase();
+        electiveSubjectNorms.add(sNorm);
+
+        const assignedRoom =
+          idx < defaultRoomsList.length
+            ? defaultRoomsList[idx]
+            : `Room-${22 + idx}`;
+
+        const teacherId =
+          subjectTeacherMap[sNorm] ||
+          facultyFallbacks[sNorm] ||
+          sub.teacher_name ||
+          sub.teacher_id ||
+          `Prof. ${sub.subject_name.split(" ")[0]}`;
+
+        synthesizedOfferings.push({
+          id: `off-${cluster.groupId}-${sub.id || idx}`,
+          elective_group_id: cluster.groupId,
+          course_id: sub.id || sub.subject_code || String(idx + 101),
+          subject_code: sub.subject_code,
+          subject_name: sub.subject_name,
+          teacher_id: teacherId,
+          teacher_name: teacherId,
+          room_id: assignedRoom,
+          room_name: assignedRoom,
+          room: assignedRoom,
+          capacity: 60,
+        });
+      });
+    }
+  });
+
+  // Retain synthesized groups from the current subjects
+  const resolvedGroups = [...synthesizedGroups];
+  const resolvedOfferings = [...synthesizedOfferings];
+
+  const subjectNamesSet = new Set(
+    subjects.map((s) => (s.subject_name || "").trim().toLowerCase()).filter(Boolean)
+  );
+
+  // If explicit electiveGroups were passed via academicScope.electiveGroups, include them
+  if (academicScope.electiveGroups && Array.isArray(academicScope.electiveGroups)) {
+    academicScope.electiveGroups.forEach((g) => {
+      if (!resolvedGroups.some((rg) => rg.id === g.id)) {
+        resolvedGroups.push(g);
+      }
+    });
+    (courseOfferings || []).forEach((o) => {
+      if (!resolvedOfferings.some((ro) => ro.id === o.id)) {
+        resolvedOfferings.push(o);
+      }
+    });
+  } else if (synthesizedGroups.length === 0 && electiveGroups && electiveGroups.length > 0) {
+    // Fall back to pre-existing academic structure electives only if no electives were synthesized from subjects
+    electiveGroups.forEach((g) => {
+      const matchingOfferings = (courseOfferings || []).filter(
+        (o) =>
+          o.elective_group_id === g.id &&
+          subjectNamesSet.has((o.subject_name || "").trim().toLowerCase())
+      );
+      if (matchingOfferings.length > 0) {
+        if (!resolvedGroups.some((rg) => rg.id === g.id)) {
+          resolvedGroups.push(g);
+          matchingOfferings.forEach((mo) => {
+            if (!resolvedOfferings.some((ro) => ro.id === mo.id)) {
+              resolvedOfferings.push(mo);
+            }
+          });
+        }
+      }
+    });
+  }
+
+  resolvedOfferings.forEach((o) => {
+    if (o.subject_name) {
+      electiveSubjectNorms.add(o.subject_name.trim().toLowerCase());
+    }
+  });
+
+  return {
+    resolvedGroups,
+    resolvedOfferings,
+    electiveSubjectNorms,
+  };
+};
+
 // ── 2. INDEPENDENT CENTRALIZED VALIDATOR ──────────────────────────────────────
 export const validateSchedule = ({
   timetable,
@@ -92,15 +303,33 @@ export const validateSchedule = ({
 
   // Resolve academic structure for electives and cohorts
   const localAcademic = academicStructure || getLocalAcademicStructure();
-  const effectiveElectives = electiveGroups || localAcademic.elective_groups || [];
-  const effectiveOfferings = courseOfferings || localAcademic.course_offerings || [];
+  const rawElectives = electiveGroups || localAcademic.elective_groups || [];
+  const rawOfferings = courseOfferings || localAcademic.course_offerings || [];
+
+  const {
+    resolvedGroups,
+    resolvedOfferings,
+  } = synthesizeElectiveGroupsAndOfferings({
+    subjects,
+    academicScope: { department, semester, division },
+    electiveGroups: rawElectives,
+    courseOfferings: rawOfferings,
+    resources: { teacherLinks, rooms },
+  });
+
+  const effectiveElectives = resolvedGroups.length > 0 ? resolvedGroups : rawElectives;
+  const effectiveOfferings = resolvedOfferings.length > 0 ? resolvedOfferings : rawOfferings;
   const effectiveStudentEnr = studentEnrollments || localAcademic.student_elective_enrollments || [];
   const effectiveCohortEnr = cohortEnrollments || localAcademic.cohort_elective_enrollments || [];
   const effectiveStudents = students || localAcademic.students || [];
   const effectiveCohorts = studentCohorts || localAcademic.student_cohorts || [];
 
   // Configuration check: Validate student / cohort duplicate enrollment and canonical references
-  if (academicStructure || electiveGroups) {
+  const hasExplicitElectiveConfig = Boolean(
+    academicStructure ||
+    (Array.isArray(electiveGroups) ? electiveGroups.length > 0 : Boolean(electiveGroups))
+  );
+  if (hasExplicitElectiveConfig) {
     const configVal = validateElectiveConfiguration({
       electiveGroups: effectiveElectives,
       courseOfferings: effectiveOfferings,
@@ -162,9 +391,16 @@ export const validateSchedule = ({
   const teacherTimeMap = {}; // "teacherId_day_slot" -> subject / details
   const roomTimeMap = {};    // "roomId_day_slot" -> subject / details
 
-  // Track weekly counts per subject & per batch
+  // Track weekly counts per subject (case-insensitive) & per batch
   const weeklyCounts = {};
-  subjects.forEach((s) => (weeklyCounts[s.subject_name] = 0));
+  const subjectMetaMap = {};
+  subjects.forEach((s) => {
+    const norm = (s.subject_name || "").trim().toLowerCase();
+    weeklyCounts[norm] = 0;
+    if (!subjectMetaMap[norm]) {
+      subjectMetaMap[norm] = s;
+    }
+  });
 
   // Track batch lab sessions per day: batchDailyLabs[batch][day]
   const batchDailyLabs = {};
@@ -321,6 +557,10 @@ export const validateSchedule = ({
 
         rawOfferings.forEach((offering) => {
           const oSub = offering.subject_name || offering.subject || "Elective";
+          const oSubNorm = (oSub || "").trim().toLowerCase();
+          if (oSubNorm) {
+            weeklyCounts[oSubNorm] = (weeklyCounts[oSubNorm] || 0) + 1;
+          }
           const oTeacher = offering.teacher_id || subjectTeacherMap[oSub];
           const oRoom = offering.room_id || offering.room;
 
@@ -440,11 +680,13 @@ export const validateSchedule = ({
         const roomId = cell.room_id || cell.room;
 
         if (subName && subName !== "-") {
-          // Weekly hours tracking
-          weeklyCounts[subName] = (weeklyCounts[subName] || 0) + 1;
+          const normSub = subName.trim().toLowerCase();
 
-          // No duplicate theory on same day
-          if (daySubjectSeen.has(subName)) {
+          // Weekly hours tracking (case-insensitive)
+          weeklyCounts[normSub] = (weeklyCounts[normSub] || 0) + 1;
+
+          // No duplicate theory on same day (case-insensitive)
+          if (daySubjectSeen.has(normSub)) {
             violations.push({
               code: "DUPLICATE_THEORY",
               day,
@@ -453,7 +695,7 @@ export const validateSchedule = ({
               message: `Theory subject "${subName}" appears more than once on ${day}`,
             });
           }
-          daySubjectSeen.add(subName);
+          daySubjectSeen.add(normSub);
 
           // Teacher checks
           if (teacherId) {
@@ -646,6 +888,22 @@ export const validateSchedule = ({
     });
   });
 
+  // Rule: Strict credit hours / weekly limit check
+  Object.keys(subjectMetaMap).forEach((norm) => {
+    const s = subjectMetaMap[norm];
+    const actual = weeklyCounts[norm] || 0;
+    const limit = parseFloat(s.weekly_hours) || 0;
+    if (limit > 0 && actual > limit) {
+      violations.push({
+        code: "WEEKLY_HOURS_EXCEEDED",
+        subject: s.subject_name,
+        actual,
+        limit,
+        message: `Subject "${s.subject_name}" has ${actual} scheduled slots, exceeding its weekly limit of ${limit} credits/hours.`,
+      });
+    }
+  });
+
   return {
     isValid: violations.length === 0,
     violations,
@@ -729,32 +987,65 @@ export const generateDeterministicTimetable = ({
       1
   );
 
+  // Deduplicate subjects case-insensitively to prevent multiple allocations of duplicate DB entries
+  const deduplicatedSubjectsMap = new Map();
+  subjects.forEach((s) => {
+    const key = (s.subject_name || "").trim().toLowerCase();
+    if (!key) return;
+    if (!deduplicatedSubjectsMap.has(key)) {
+      deduplicatedSubjectsMap.set(key, { ...s, subject_name: s.subject_name.trim() });
+    } else {
+      const existing = deduplicatedSubjectsMap.get(key);
+      if (!existing.subject_code && s.subject_code) {
+        deduplicatedSubjectsMap.set(key, { ...s, subject_name: existing.subject_name });
+      }
+    }
+  });
+  const canonicalSubjects = Array.from(deduplicatedSubjectsMap.values());
+
   // Resolve academic structure for electives, offerings, cohorts, and students
   const academicData = getLocalAcademicStructure();
-  const effectiveElectives = electiveGroups || academicData.elective_groups || [];
-  const effectiveOfferings = courseOfferings || academicData.course_offerings || [];
+  const rawElectives = electiveGroups || academicData.elective_groups || [];
+  const rawOfferings = courseOfferings || academicData.course_offerings || [];
   const effectiveStudentEnr = studentEnrollments || academicData.student_elective_enrollments || [];
   const effectiveCohortEnr = cohortEnrollments || academicData.cohort_elective_enrollments || [];
   const effectiveStudents = students || academicData.students || [];
   const effectiveCohorts = studentCohorts || academicData.student_cohorts || [];
 
+  // Synthesize and resolve parallel elective groups and offerings
+  const {
+    resolvedGroups,
+    resolvedOfferings,
+    electiveSubjectNorms,
+  } = synthesizeElectiveGroupsAndOfferings({
+    subjects: canonicalSubjects,
+    academicScope,
+    electiveGroups: rawElectives,
+    courseOfferings: rawOfferings,
+    resources,
+  });
+
+  const effectiveElectives = resolvedGroups.length > 0 ? resolvedGroups : rawElectives;
+  const effectiveOfferings = resolvedOfferings.length > 0 ? resolvedOfferings : rawOfferings;
+
   // 1. Mandatory configuration validation check: Prevent generation & publication on configuration errors
-  const hasElectiveSubjects = subjects.some(
+  const hasElectiveSubjects = canonicalSubjects.some(
     (s) =>
       s.is_elective ||
       (s.course_category && s.course_category.toLowerCase().includes("elective")) ||
-      s.elective_group_id
+      s.elective_group_id ||
+      electiveSubjectNorms.has((s.subject_name || "").trim().toLowerCase())
   );
 
   const shouldValidateElectives = Boolean(academicScope.electiveGroups || hasElectiveSubjects || academicScope.academicStructure);
 
-  if (shouldValidateElectives) {
+  if (shouldValidateElectives && effectiveElectives.length > 0) {
     const configVal = validateElectiveConfiguration({
       electiveGroups: effectiveElectives,
       courseOfferings: effectiveOfferings,
       studentEnrollments: effectiveStudentEnr,
       cohortEnrollments: effectiveCohortEnr,
-      subjects,
+      subjects: canonicalSubjects,
       students: effectiveStudents,
       cohorts: effectiveCohorts,
       scope: { department: academicScope.department, semester: academicScope.semester },
@@ -789,8 +1080,10 @@ export const generateDeterministicTimetable = ({
     }
   }
 
-  const labSubjects = subjects.filter((s) => s.is_lab);
-  const theorySubjects = subjects.filter((s) => !s.is_lab);
+  const labSubjects = canonicalSubjects.filter((s) => s.is_lab);
+  const theorySubjects = canonicalSubjects.filter(
+    (s) => !s.is_lab && !electiveSubjectNorms.has((s.subject_name || "").trim().toLowerCase())
+  );
 
   const teacherLinks = resources.teacherLinks || [];
   const subjectTeacherMap = {};
@@ -902,14 +1195,7 @@ export const generateDeterministicTimetable = ({
     // ── STEP 0: SCHEDULE PARALLEL ELECTIVE GROUPS ────────────────────────
     // Different elective options in the same group are scheduled in parallel
     // during configured elective periods using separate qualified teachers and suitable rooms.
-    const hasElectiveSubjects = subjects.some(
-      (s) =>
-        s.is_elective ||
-        (s.course_category && s.course_category.toLowerCase().includes("elective")) ||
-        s.elective_group_id
-    );
-
-    const relevantElectiveGroups = (academicScope.electiveGroups || (hasElectiveSubjects ? effectiveElectives : [])).filter(
+    const relevantElectiveGroups = (academicScope.electiveGroups || (resolvedGroups.length > 0 ? resolvedGroups : effectiveElectives)).filter(
       (g) =>
         (g.department_code?.toUpperCase() === academicScope.department?.toUpperCase() || g.department_code === "ALL") &&
         parseInt(g.semester) === parseInt(academicScope.semester)
@@ -918,7 +1204,7 @@ export const generateDeterministicTimetable = ({
     let electivePlacementSuccess = true;
 
     for (const group of relevantElectiveGroups) {
-      const groupOfferings = effectiveOfferings.filter((o) => o.elective_group_id === group.id);
+      const groupOfferings = resolvedOfferings.filter((o) => o.elective_group_id === group.id);
       if (groupOfferings.length === 0) continue;
 
       const hoursNeeded = group.weekly_hours || 3;
@@ -1089,6 +1375,15 @@ export const generateDeterministicTimetable = ({
           const cell1 = timetable[day][s1];
           const cell2 = timetable[day][s2];
 
+          // A lab session can only be placed into free slots or alongside other parallel batch labs
+          const canAcceptLab = (cell) => {
+            if (cell === "-") return true;
+            if (cell && cell.batch_labs && !cell.is_elective) return true;
+            return false;
+          };
+
+          if (!canAcceptLab(cell1) || !canAcceptLab(cell2)) continue;
+
           // Check if batch is already doing another lab in this window
           const bAlreadyBusy = (cell) => {
             if (cell && cell.batch_labs) {
@@ -1163,7 +1458,9 @@ export const generateDeterministicTimetable = ({
 
     // ── STEP 2: SCHEDULE COMMON DIVISION THEORY SESSIONS ───────────────────
     const remainingTheory = {};
-    theorySubjects.forEach((ts) => (remainingTheory[ts.subject_name] = ts.weekly_hours || 4));
+    theorySubjects.forEach(
+      (ts) => (remainingTheory[ts.subject_name.trim().toLowerCase()] = ts.weekly_hours || 4)
+    );
 
     for (let slotIdx = 0; slotIdx < classSlots.length; slotIdx++) {
       const slot = classSlots[slotIdx];
@@ -1175,11 +1472,15 @@ export const generateDeterministicTimetable = ({
 
         // Candidate theory subjects that still need hours and not yet taken today
         const candidates = theorySubjects.filter((ts) => {
-          if ((remainingTheory[ts.subject_name] || 0) <= 0) return false;
-          // Check if already taken on this day
+          const normName = ts.subject_name.trim().toLowerCase();
+          if ((remainingTheory[normName] || 0) <= 0) return false;
+          // Check if already taken on this day (case-insensitive)
           const alreadyOnDay = classSlots.some((sl) => {
             const c = timetable[day][sl];
-            return c && (c === ts.subject_name || c.subject_name === ts.subject_name);
+            const cName = (typeof c === "string" ? c : c?.subject_name || "")
+              .trim()
+              .toLowerCase();
+            return cName === normName;
           });
           if (alreadyOnDay) return false;
 
@@ -1195,9 +1496,14 @@ export const generateDeterministicTimetable = ({
 
         if (candidates.length === 0) continue;
 
-        // Pick with minimum remaining or round-robin
-        candidates.sort((a, b) => remainingTheory[b.subject_name] - remainingTheory[a.subject_name]);
+        // Pick with highest remaining or round-robin
+        candidates.sort(
+          (a, b) =>
+            remainingTheory[b.subject_name.trim().toLowerCase()] -
+            remainingTheory[a.subject_name.trim().toLowerCase()]
+        );
         const chosen = candidates[0];
+        const chosenNorm = chosen.subject_name.trim().toLowerCase();
 
         timetable[day][slot] = {
           subject_name: chosen.subject_name,
@@ -1208,7 +1514,7 @@ export const generateDeterministicTimetable = ({
 
         const tId = subjectTeacherMap[chosen.subject_name];
         if (tId) teacherSlotUsage[`${tId}_${day}_${slot}`] = chosen.subject_name;
-        remainingTheory[chosen.subject_name]--;
+        remainingTheory[chosenNorm]--;
       }
     }
 
@@ -1226,10 +1532,10 @@ export const generateDeterministicTimetable = ({
       division: academicScope.division,
       semester: academicScope.semester,
       department: academicScope.department,
-      electiveGroups: (academicScope.electiveGroups || hasElectiveSubjects) ? effectiveElectives : null,
-      courseOfferings: (academicScope.electiveGroups || hasElectiveSubjects) ? effectiveOfferings : null,
-      studentEnrollments: (academicScope.electiveGroups || hasElectiveSubjects) ? effectiveStudentEnr : null,
-      cohortEnrollments: (academicScope.electiveGroups || hasElectiveSubjects) ? effectiveCohortEnr : null,
+      electiveGroups: resolvedGroups.length > 0 ? resolvedGroups : null,
+      courseOfferings: resolvedOfferings.length > 0 ? resolvedOfferings : null,
+      studentEnrollments: effectiveStudentEnr,
+      cohortEnrollments: effectiveCohortEnr,
       students: effectiveStudents,
       studentCohorts: effectiveCohorts,
     });

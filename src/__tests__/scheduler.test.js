@@ -625,4 +625,221 @@ describe("Critical Scheduling Fix: One Lab Per Day Per Division and Semester", (
     expect(result.error).toContain("Infeasible configuration");
     expect(result.qualityScore.rating).toBe("INVALID");
   });
+
+  // ── TEST 15: STRICT WEEKLY CREDIT HOURS ENFORCEMENT ───────────────────────
+  test("15. Flags WEEKLY_HOURS_EXCEEDED if a subject is scheduled for more slots than its weekly_hours", () => {
+    const testSubjects = [
+      { subject_name: "Software Testing", is_lab: false, weekly_hours: 3 },
+    ];
+
+    // Build timetable with 4 slots of Software Testing (exceeding 3)
+    const badTimetable = {};
+    DAYS.forEach((d) => {
+      badTimetable[d] = {};
+      classSlotLabels.forEach((s) => (badTimetable[d][s] = "-"));
+    });
+    badTimetable["Monday"]["09:00 AM-10:00 AM"] = { subject_name: "Software Testing" };
+    badTimetable["Tuesday"]["09:00 AM-10:00 AM"] = { subject_name: "Software Testing" };
+    badTimetable["Wednesday"]["09:00 AM-10:00 AM"] = { subject_name: "Software Testing" };
+    badTimetable["Thursday"]["09:00 AM-10:00 AM"] = { subject_name: "Software Testing" }; // 4th slot!
+
+    const val = validateSchedule({
+      timetable: badTimetable,
+      subjects: testSubjects,
+      slots,
+      constraints: {},
+      batches: ["B1", "B2"],
+    });
+
+    expect(val.isValid).toBe(false);
+    const hourViolation = val.violations.find((v) => v.code === "WEEKLY_HOURS_EXCEEDED");
+    expect(hourViolation).toBeDefined();
+    expect(hourViolation.actual).toBe(4);
+    expect(hourViolation.limit).toBe(3);
+  });
+
+  // ── TEST 16: CASE-INSENSITIVE DEDUPLICATION OF DUPLICATE ENTRIES ──────────
+  test("16. Deduplicates subjects with different casing (e.g., Software Testing vs Software testing) and respects 3 weekly hours", () => {
+    const duplicateSubjects = [
+      { subject_name: "Software Testing", is_lab: false, weekly_hours: 3 },
+      { subject_name: "Software testing", is_lab: false, weekly_hours: 3 },
+    ];
+
+    const result = generateDeterministicTimetable({
+      subjects: duplicateSubjects,
+      slots,
+      constraints: {},
+      resources: { teacherLinks: [], rooms: [] },
+      academicScope: {
+        department: "CSE",
+        semester: 7,
+        division: "CSE-A",
+        batches: ["B1", "B2"],
+      },
+    });
+
+    expect(result.timetable).toBeDefined();
+
+    // Count how many times Software Testing / Software testing appears in total across the week
+    let totalScheduled = 0;
+    DAYS.forEach((d) => {
+      classSlotLabels.forEach((sl) => {
+        const cell = result.timetable[d]?.[sl];
+        const name = (typeof cell === "string" ? cell : cell?.subject_name || "").toLowerCase();
+        if (name === "software testing") {
+          totalScheduled++;
+        }
+      });
+    });
+
+    // Must be exactly 3, NOT 6!
+    expect(totalScheduled).toBe(3);
+  });
+
+  // ── TEST 17: PARALLEL ELECTIVE BASKET SCHEDULING (PE-1 & PE-2) ─────────────
+  test("17. Elective groups PE-1 (Distributed Systems & NLP) and PE-2 (Deep Learning & Software Testing) run simultaneously in parallel across separate rooms with 3 slots each", () => {
+    const sdmSubjects = [
+      {
+        id: 1,
+        subject_name: "Cryptography and Network Security",
+        subject_code: "22UCSC700",
+        weekly_hours: 4,
+        is_lab: false,
+        course_category: "Core",
+      },
+      {
+        id: 2,
+        subject_name: "Distributed Systems and Applications",
+        subject_code: "22UCSE720",
+        weekly_hours: 3,
+        is_lab: false,
+        course_category: "Professional Elective",
+        elective_group_id: "PE-1",
+      },
+      {
+        id: 3,
+        subject_name: "Natural Language Processing",
+        subject_code: "22UCSE721",
+        weekly_hours: 3,
+        is_lab: false,
+        course_category: "Professional Elective",
+        elective_group_id: "PE-1",
+      },
+      {
+        id: 4,
+        subject_name: "Deep Learning And Applications",
+        subject_code: "22UCSE730",
+        weekly_hours: 3,
+        is_lab: false,
+        course_category: "Professional Elective",
+        elective_group_id: "PE-2",
+      },
+      {
+        id: 5,
+        subject_name: "Software Testing",
+        subject_code: "22UCSE731",
+        weekly_hours: 3,
+        is_lab: false,
+        course_category: "Professional Elective",
+        elective_group_id: "PE-2",
+      },
+      {
+        id: 6,
+        subject_name: "Blockchain Technology",
+        subject_code: "22UCSO740",
+        weekly_hours: 3,
+        is_lab: false,
+        course_category: "Open Elective",
+      },
+      {
+        id: 7,
+        subject_name: "Cryptography and Network Security Laboratory",
+        subject_code: "22UCSL701",
+        weekly_hours: 1,
+        is_lab: true,
+        course_category: "Laboratory",
+      },
+    ];
+
+    const sdmRooms = [
+      { room_name: "Room-22", is_lab: false },
+      { room_name: "CSE Seminar Hall", is_lab: false },
+      { room_name: "Lab 1", is_lab: true },
+    ];
+
+    const result = generateDeterministicTimetable({
+      subjects: sdmSubjects,
+      slots,
+      constraints: mockConstraints,
+      resources: { teacherLinks: [], rooms: sdmRooms },
+      academicScope: {
+        department: "CSE",
+        semester: 7,
+        division: "CSE-B",
+        batches: ["B1", "B2", "B3"],
+      },
+    });
+
+    expect(result.timetable).toBeDefined();
+    expect(result.validation.isValid).toBe(true);
+    expect(result.qualityScore.score).toBe(100);
+
+    // Track parallel elective slots
+    let pe1ParallelSlots = 0;
+    let pe2ParallelSlots = 0;
+    let standaloneElectiveCount = 0;
+    let cryptoCount = 0;
+    let blockchainCount = 0;
+
+    DAYS.forEach((d) => {
+      classSlotLabels.forEach((sl) => {
+        const cell = result.timetable[d]?.[sl];
+        if (!cell || cell === "-") return;
+
+        if (cell.is_elective && cell.offerings) {
+          const names = cell.offerings.map((o) => o.subject_name.toLowerCase());
+          const rooms = cell.offerings.map((o) => o.room || o.room_name);
+          const teachers = cell.offerings.map((o) => o.teacher_id || o.teacher_name);
+
+          // Rule: Each parallel elective slot must have distinct rooms & teachers
+          expect(new Set(rooms).size).toBe(cell.offerings.length);
+          expect(new Set(teachers).size).toBe(cell.offerings.length);
+
+          if (names.some((n) => n.includes("distr")) && names.some((n) => n.includes("natural"))) {
+            pe1ParallelSlots++;
+          }
+          if (names.some((n) => n.includes("deep")) && names.some((n) => n.includes("software"))) {
+            pe2ParallelSlots++;
+          }
+        } else if (!cell.is_lab) {
+          const name = (typeof cell === "string" ? cell : cell.subject_name || "").toLowerCase();
+          if (
+            name.includes("software testing") ||
+            name.includes("deep learning") ||
+            name.includes("distr") ||
+            name.includes("natural")
+          ) {
+            standaloneElectiveCount++;
+          }
+          if (name.includes("cryptography and network security") && !name.includes("laboratory")) {
+            cryptoCount++;
+          }
+          if (name.includes("blockchain")) {
+            blockchainCount++;
+          }
+        }
+      });
+    });
+
+    // PE-1 must have exactly 3 parallel slots
+    expect(pe1ParallelSlots).toBe(3);
+    // PE-2 must have exactly 3 parallel slots
+    expect(pe2ParallelSlots).toBe(3);
+    // None of the electives should be scheduled as standalone solo classes
+    expect(standaloneElectiveCount).toBe(0);
+    // Core theory classes
+    expect(cryptoCount).toBe(4);
+    expect(blockchainCount).toBe(3);
+  });
 });
+
