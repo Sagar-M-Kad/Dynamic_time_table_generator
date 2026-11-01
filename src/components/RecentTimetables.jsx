@@ -3,6 +3,7 @@ import { supabase } from "../supabaseClient";
 import { toast } from "react-hot-toast";
 import Button from "@mui/material/Button";
 import { createSlotsWithBreaks } from "../services/aiService";
+import { resolveSubjectCode } from "../services/schedulerEngine";
 import jsPDF from "jspdf";
 import autoTable from "jspdf-autotable";
 
@@ -408,14 +409,29 @@ const RecentTimetables = () => {
 
           const formattedContent = (cell) => {
             if (!cell || cell === "-" || cell === "—") return "—";
-            if (typeof cell === "string") return cell;
+            if (typeof cell === "string") {
+              const code = resolveSubjectCode(cell);
+              return code || cell;
+            }
             if (cell.batch_labs && cell.batch_labs.length > 0) {
               return cell.batch_labs
-                .map((bl) => `${bl.batch}: ${bl.subject_name} (${bl.room || "Lab"})`)
+                .map((bl) => {
+                  const sCode = bl.subject_code || resolveSubjectCode(bl.subject_name) || bl.subject_name;
+                  return `${sCode} (${bl.batch})${bl.room ? ` - ${bl.room}` : ""}`;
+                })
+                .join("\n");
+            }
+            if (cell.offerings && cell.offerings.length > 0) {
+              return cell.offerings
+                .map((o) => {
+                  const sCode = o.subject_code || resolveSubjectCode(o.subject_name) || o.subject_name;
+                  return `${sCode}${o.room || o.room_name ? ` (${o.room || o.room_name})` : ""}`;
+                })
                 .join("\n");
             }
             if (cell.subject_name) {
-              return cell.room ? `${cell.subject_name} (${cell.room})` : cell.subject_name;
+              const sCode = cell.subject_code || resolveSubjectCode(cell.subject_name) || cell.subject_name;
+              return cell.room ? `${sCode} (${cell.room})` : sCode;
             }
             return String(cell);
           };
@@ -736,20 +752,35 @@ const RecentTimetables = () => {
         // Apply View Filters
         let displaySubject = "-";
         let filteredBatchLabs = null;
+        let filteredOfferings = null;
 
         if (typeof rawSubject === "object") {
           if (rawSubject.batch_labs) {
+            const enrichedLabs = rawSubject.batch_labs.map((bl) => ({
+              ...bl,
+              subject_code: bl.subject_code || resolveSubjectCode(bl.subject_name),
+            }));
             if (viewMode === "batch" && selectedBatch !== "ALL") {
-              const matched = rawSubject.batch_labs.filter((bl) => bl.batch === selectedBatch);
+              const matched = enrichedLabs.filter((bl) => bl.batch === selectedBatch);
               filteredBatchLabs = matched;
               displaySubject = matched.length > 0 ? `${matched[0].batch}: ${matched[0].subject_name} (${matched[0].room || "Lab"})` : "-";
             } else if (viewMode === "room" && selectedRoom !== "ALL") {
-              const matched = rawSubject.batch_labs.filter((bl) => bl.room === selectedRoom);
+              const matched = enrichedLabs.filter((bl) => bl.room === selectedRoom);
               filteredBatchLabs = matched;
               displaySubject = matched.length > 0 ? matched.map((m) => `${m.batch}: ${m.subject_name}`).join(" | ") : "-";
             } else {
-              filteredBatchLabs = rawSubject.batch_labs;
-              displaySubject = rawSubject.batch_labs.map((l) => `${l.batch}: ${l.subject_name}`).join(" | ");
+              filteredBatchLabs = enrichedLabs;
+              displaySubject = enrichedLabs.map((l) => `${l.batch}: ${l.subject_name}`).join(" | ");
+            }
+          } else if (rawSubject.offerings && rawSubject.offerings.length > 0) {
+            filteredOfferings = rawSubject.offerings.map((off) => ({
+              ...off,
+              subject_code: off.subject_code || resolveSubjectCode(off.subject_name),
+            }));
+            displaySubject = rawSubject.subject_name || "Parallel Electives";
+            if (viewMode === "room" && selectedRoom !== "ALL") {
+              const matched = filteredOfferings.filter((o) => (o.room === selectedRoom || o.room_name === selectedRoom));
+              if (matched.length === 0) displaySubject = "-";
             }
           } else {
             displaySubject = rawSubject.subject_name || "-";
@@ -764,11 +795,20 @@ const RecentTimetables = () => {
           }
         }
 
+        const resolvedCode =
+          typeof rawSubject === "object"
+            ? (rawSubject?.subject_code || resolveSubjectCode(rawSubject?.subject_name))
+            : (displaySubject !== "-" ? resolveSubjectCode(displaySubject) : undefined);
+
         cells.push({
           colType: "class",
           label: col.label,
           subject: displaySubject,
+          subject_code: resolvedCode,
           batch_labs: filteredBatchLabs,
+          offerings: filteredOfferings,
+          isElective: Boolean(rawSubject?.is_elective || (filteredOfferings && filteredOfferings.length > 0)),
+          elective_group_name: rawSubject?.elective_group_name,
           room: rawSubject?.room,
           span,
           isLab: isLab && displaySubject !== "-",
@@ -961,6 +1001,7 @@ const RecentTimetables = () => {
                                 {cell.batch_labs.map((bl, bIdx) => (
                                   <div
                                     key={bIdx}
+                                    title={bl.subject_name}
                                     style={{
                                       fontSize: "0.78rem",
                                       background: "rgba(255,255,255,0.7)",
@@ -968,13 +1009,73 @@ const RecentTimetables = () => {
                                       borderRadius: 4,
                                     }}
                                   >
-                                    <b style={{ color: "#4338ca" }}>{bl.batch}:</b> {bl.subject_name} ({bl.room || "Lab"})
+                                    <b style={{ color: "#4338ca" }}>{bl.batch}:</b>{" "}
+                                    <b style={{ color: "#1e293b", fontSize: "0.82rem" }}>
+                                      {bl.subject_code || bl.subject_name}
+                                    </b>
+                                    {' '}({bl.room || "Lab"})
                                   </div>
                                 ))}
                               </div>
                             ) : (
-                              cell.subject
+                              <div title={cell.subject}>
+                                <div style={{ fontWeight: 700, fontSize: "0.88rem", color: "#1e1b4b" }}>
+                                  {cell.subject_code || cell.subject}
+                                </div>
+                              </div>
                             )}
+                          </td>
+                        );
+                      }
+                      // Parallel Elective cell
+                      if (cell.isElective && cell.offerings && cell.offerings.length > 0) {
+                        return (
+                          <td
+                            key={idx}
+                            style={{
+                              ...tStyle.cell,
+                              background: "#fffbeb",
+                              border: "1px solid #fed7aa",
+                            }}
+                          >
+                            <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                              <span
+                                style={{
+                                  fontSize: "0.68rem",
+                                  fontWeight: 800,
+                                  color: "#b45309",
+                                  background: "#fef3c7",
+                                  padding: "1px 4px",
+                                  borderRadius: 3,
+                                  alignSelf: "flex-start",
+                                }}
+                              >
+                                ⚡ {cell.elective_group_name || "ELECTIVE"}
+                              </span>
+                              {cell.offerings.map((off, oIdx) => (
+                                <div
+                                  key={oIdx}
+                                  title={off.subject_name}
+                                  style={{
+                                    fontSize: "0.75rem",
+                                    background: "rgba(255,255,255,0.85)",
+                                    padding: "2px 5px",
+                                    borderRadius: 3,
+                                    border: "1px solid #fed7aa",
+                                    textAlign: "left",
+                                  }}
+                                >
+                                  <b style={{ color: "#9a3412", fontSize: "0.82rem" }}>
+                                    {off.subject_code || off.subject_name}
+                                  </b>
+                                  {(off.room_name || off.room) && (
+                                    <span style={{ fontSize: "0.68rem", color: "#64748b", marginLeft: 4 }}>
+                                      📍 {off.room_name || off.room}
+                                    </span>
+                                  )}
+                                </div>
+                              ))}
+                            </div>
                           </td>
                         );
                       }
@@ -993,10 +1094,12 @@ const RecentTimetables = () => {
                           {cell.subject === "-" ? (
                             <span style={{ color: "#cbd5e1" }}>—</span>
                           ) : (
-                            <div>
-                              <div>{cell.subject}</div>
+                            <div title={cell.subject}>
+                              <div style={{ fontWeight: 700, fontSize: "0.88rem", color: "#1e1b4b" }}>
+                                {cell.subject_code || cell.subject}
+                              </div>
                               {cell.room && (
-                                <div style={{ fontSize: "0.7rem", color: "#64748b" }}>
+                                <div style={{ fontSize: "0.7rem", color: "#64748b", marginTop: 2 }}>
                                   📍 {cell.room}
                                 </div>
                               )}

@@ -433,4 +433,66 @@ describe("Academic Structure Hierarchy & Elective Rules", () => {
     expect(validation.isValid).toBe(true);
     expect(validation.violations.length).toBe(0);
   });
+
+  test("14. Teacher ID & Time Slot Mismatch: Blocked slots with start-time key and numeric teacher_id strictly prevent scheduling and are flagged by validator", () => {
+    // Prof Radhika Amashi: DB ID 83, blocked on Monday at start time format (e.g. '08:00 AM' or start of slot 0)
+    const slot0 = classSlotLabels[0];
+    const startOfSlot0 = slot0.split("-")[0].trim();
+
+    const teacherLinks = [
+      {
+        teacher_id: 83,
+        teachers: { id: 83, name: "Prof Radhika Amashi" },
+        subjects: { id: "102", subject_name: "Natural Language Processing" },
+      },
+    ];
+
+    const busyData = [
+      {
+        teacher_id: 83, // Numeric DB ID
+        day_of_week: "Monday",
+        time_slot: startOfSlot0, // Start-time format ("09:00 AM" or "08:00 AM")
+        is_busy: true,
+      },
+    ];
+
+    const testTT = {};
+    DAYS.forEach((d) => {
+      testTT[d] = {};
+      classSlotLabels.forEach((sl) => (testTT[d][sl] = "-"));
+    });
+
+    testTT["Monday"][slot0] = {
+      is_elective: true,
+      elective_group_id: "PE-1",
+      offerings: [
+        {
+          course_offering_id: "off-1",
+          course_id: "102",
+          subject_name: "Natural Language Processing",
+          teacher_id: "Prof Radhika Amashi", // String name from synthesis
+          room_id: "Room-22",
+        },
+      ],
+    };
+
+    const valResult = validateSchedule({
+      timetable: testTT,
+      subjects: [
+        { id: "102", subject_name: "Natural Language Processing", is_lab: false, weekly_hours: 3 },
+      ],
+      slots,
+      constraints: mockConstraints,
+      teacherLinks,
+      teacherBusy: busyData,
+      batches: ["B1", "B2"],
+      division: "CSE-A",
+      semester: 7,
+      department: "CSE",
+    });
+
+    // Validator MUST detect TEACHER_BUSY despite ID 83 vs name and start slot vs range slot
+    expect(valResult.isValid).toBe(false);
+    expect(valResult.violations.some((v) => v.code === "TEACHER_BUSY")).toBe(true);
+  });
 });

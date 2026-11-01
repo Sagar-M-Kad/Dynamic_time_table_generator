@@ -5,6 +5,9 @@ import {
   validateSchedule,
   calculateTimetableQualityScore,
   repairSchedule,
+  buildTeacherMaps,
+  buildTeacherBusyIndex,
+  isTeacherBusy,
 } from "./schedulerEngine";
 import { fetchAcademicStructure } from "./academicStructureService";
 
@@ -109,11 +112,14 @@ export const fetchGenerationData = async (semester, department) => {
 
   if (roomErr) console.warn("Could not fetch rooms:", roomErr.message);
 
+  const { data: teacherList } = await supabase.from("teachers").select("*");
+
   return {
     subjects: subjects || [],
     constraints,
     resources: {
       teacherLinks: teacherLinks || [],
+      teachers: teacherList || [],
       rooms: rooms || [],
     },
     busyMap: {
@@ -529,12 +535,8 @@ export const validateTimetable = (
 ) => {
   const conflicts = [];
   const subjectTeacherMap = buildSubjectTeacherMap(teacherLinks);
-
-  const busySet = new Set(
-    (teacherBusy || []).map(
-      (b) => `${b.teacher_id}_${b.day_of_week}_${b.time_slot}`
-    )
-  );
+  const teacherMaps = buildTeacherMaps(teacherLinks);
+  const busySet = buildTeacherBusyIndex(teacherBusy, teacherMaps);
 
   const subjectWeeklyCount = {};
   subjects.forEach((s) => (subjectWeeklyCount[s.subject_name] = 0));
@@ -590,9 +592,10 @@ export const validateTimetable = (
       // Teacher checks
       const teacherId = subjectTeacherMap[subject];
       if (teacherId) {
-        const key = `${teacherId}_${day}_${slot}`;
+        const canonicalTId = teacherMaps.nameToId.get(String(teacherId).toLowerCase()) || String(teacherId);
+        const key = `${canonicalTId}_${day}_${slot}`;
 
-        if (busySet.has(key)) {
+        if (isTeacherBusy(busySet, teacherId, day, slot, teacherMaps)) {
           conflicts.push(
             `TEACHER_BUSY: Teacher for "${subject}" is unavailable on ${day} at ${slot}`
           );

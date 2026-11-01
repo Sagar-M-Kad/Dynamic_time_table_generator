@@ -15,6 +15,7 @@ import {
   validateTimetable,
   getLabLabel,
 } from "../services/aiService";
+import { resolveSubjectCode } from "../services/schedulerEngine";
 
 const DAYS = [
   "Monday",
@@ -159,11 +160,12 @@ const GenerateAI = () => {
     subjects,
     filterOptions = {}
   ) => {
-    const mode = filterOptions.mode || viewMode;
-    const batchFilter = filterOptions.batchFilter || selectedBatchFilter;
-    const teacherFilter = filterOptions.teacherFilter || selectedTeacherFilter;
-    const roomFilter = filterOptions.roomFilter || selectedRoomFilter;
-    const electiveFilter = filterOptions.electiveFilter || selectedElectiveFilter;
+    const opts = typeof filterOptions === "string" ? { batchFilter: filterOptions } : (filterOptions || {});
+    const mode = opts.mode || viewMode;
+    const batchFilter = opts.batchFilter || selectedBatchFilter;
+    const teacherFilter = opts.teacherFilter || selectedTeacherFilter;
+    const roomFilter = opts.roomFilter || selectedRoomFilter;
+    const electiveFilter = opts.electiveFilter || selectedElectiveFilter;
 
     const labs = (subjects || []).filter((s) => s.is_lab);
     const combinedLabLabel = labs.length > 0 ? getLabLabel(labs) : null;
@@ -230,6 +232,7 @@ const GenerateAI = () => {
               type: "class",
               label: slot.label,
               subject: matched,
+              subject_code: resolveSubjectCode(matched, subjects),
               room: matchedRoom,
               isTeacherMatch: true,
             });
@@ -284,6 +287,7 @@ const GenerateAI = () => {
               type: "class",
               label: slot.label,
               subject: matched,
+              subject_code: resolveSubjectCode(matched, subjects),
               teacher: matchedTeacher,
               room: roomFilter,
               isRoomMatch: true,
@@ -303,13 +307,17 @@ const GenerateAI = () => {
         if (mode === "ELECTIVE") {
           if (typeof rawCell === "object" && rawCell.is_elective) {
             if (electiveFilter === "ALL" || rawCell.elective_group_id === electiveFilter) {
+              const enrichedOfferings = (rawCell.offerings || []).map((off) => ({
+                ...off,
+                subject_code: off.subject_code || resolveSubjectCode(off.subject_name, subjects),
+              }));
               row.push({
                 type: "class",
                 label: slot.label,
                 subject: rawCell.subject_name || "Parallel Electives",
                 isElective: true,
                 elective_group_name: rawCell.elective_group_name,
-                offerings: rawCell.offerings || [],
+                offerings: enrichedOfferings,
                 room: rawCell.room,
               });
               continue;
@@ -337,12 +345,17 @@ const GenerateAI = () => {
           }
 
           const isStart = relevantLabs.some((l) => l.is_block_start);
+          const enrichedLabs = relevantLabs.map((l) => ({
+            ...l,
+            subject_code: l.subject_code || resolveSubjectCode(l.subject_name, subjects),
+          }));
+
           if (isStart) {
             row.push({
               type: "class",
               label: slot.label,
-              subject: relevantLabs.map((l) => `${l.batch}: ${l.subject_name}`).join(" | "),
-              batch_labs: relevantLabs,
+              subject: enrichedLabs.map((l) => `${l.batch}: ${l.subject_name}`).join(" | "),
+              batch_labs: enrichedLabs,
               labSpan: 2,
               isLab: true,
             });
@@ -352,7 +365,7 @@ const GenerateAI = () => {
               row.push({
                 type: "class",
                 label: slots[i].label,
-                subject: relevantLabs.map((l) => `${l.batch}: ${l.subject_name}`).join(" | "),
+                subject: enrichedLabs.map((l) => `${l.batch}: ${l.subject_name}`).join(" | "),
                 labSkip: true,
               });
             }
@@ -360,31 +373,38 @@ const GenerateAI = () => {
             row.push({
               type: "class",
               label: slot.label,
-              subject: relevantLabs.map((l) => `${l.batch}: ${l.subject_name}`).join(" | "),
-              batch_labs: relevantLabs,
+              subject: enrichedLabs.map((l) => `${l.batch}: ${l.subject_name}`).join(" | "),
+              batch_labs: enrichedLabs,
               isLab: true,
             });
           }
         } else if (typeof rawCell === "object" && rawCell.is_elective) {
+          const enrichedOfferings = (rawCell.offerings || []).map((off) => ({
+            ...off,
+            subject_code: off.subject_code || resolveSubjectCode(off.subject_name, subjects),
+          }));
           row.push({
             type: "class",
             label: slot.label,
             subject: rawCell.subject_name || "Parallel Electives",
             isElective: true,
             elective_group_name: rawCell.elective_group_name,
-            offerings: rawCell.offerings || [],
+            offerings: enrichedOfferings,
             room: rawCell.room,
           });
         } else if (typeof rawCell === "object" && rawCell.subject_name) {
+          const sCode = rawCell.subject_code || resolveSubjectCode(rawCell.subject_name, subjects);
           row.push({
             type: "class",
             label: slot.label,
             subject: rawCell.subject_name,
+            subject_code: sCode,
             room: rawCell.room,
           });
         } else {
           // Legacy string cell
           const subject = rawCell;
+          const sCode = subject && subject !== "-" ? resolveSubjectCode(subject, subjects) : "";
           const isLab = combinedLabLabel && subject === combinedLabLabel;
 
           if (isLab) {
@@ -400,6 +420,7 @@ const GenerateAI = () => {
               type: "class",
               label: slot.label,
               subject,
+              subject_code: sCode,
               labSpan: span,
               isLab: true,
             });
@@ -409,11 +430,17 @@ const GenerateAI = () => {
                 type: "class",
                 label: slots[i].label,
                 subject,
+                subject_code: sCode,
                 labSkip: true,
               });
             }
           } else {
-            row.push({ type: "class", label: slot.label, subject });
+            row.push({
+              type: "class",
+              label: slot.label,
+              subject,
+              subject_code: sCode,
+            });
           }
         }
       }
@@ -473,7 +500,10 @@ const GenerateAI = () => {
             row.push(c.type.toUpperCase());
           } else if (c.batch_labs && c.batch_labs.length > 0) {
             const content = c.batch_labs
-              .map((bl) => `${bl.batch}: ${bl.subject_name} (${bl.room || "Lab"})`)
+              .map((bl) => {
+                const sCode = bl.subject_code || resolveSubjectCode(bl.subject_name, subjects) || bl.subject_name;
+                return `${sCode} (${bl.batch})${bl.room ? ` - ${bl.room}` : ""}`;
+              })
               .join("\n");
             if (c.labSpan > 1) {
               row.push({ content, colSpan: c.labSpan });
@@ -481,14 +511,21 @@ const GenerateAI = () => {
               row.push(content);
             }
           } else if (c.isElective && c.offerings && c.offerings.length > 0) {
-            const content =
-              `⚡ [${c.elective_group_name || "Elective Group"}]\n` +
-              c.offerings
-                .map((o) => `${o.subject_name} (${o.teacher_name || o.teacher_id} @ ${o.room || o.room_name})`)
-                .join("\n");
+            const content = c.offerings
+              .map((o) => {
+                const sCode = o.subject_code || resolveSubjectCode(o.subject_name, subjects) || o.subject_name;
+                return `${sCode}${o.room || o.room_name ? ` (${o.room || o.room_name})` : ""}`;
+              })
+              .join("\n");
             row.push(content);
           } else {
-            row.push(c.subject || "-");
+            if (c.subject && c.subject !== "-") {
+              const sCode = c.subject_code || resolveSubjectCode(c.subject, subjects) || c.subject;
+              const roomStr = c.room ? ` (${c.room})` : "";
+              row.push(`${sCode}${roomStr}`);
+            } else {
+              row.push("-");
+            }
           }
         });
         return row;
@@ -554,7 +591,7 @@ const GenerateAI = () => {
           body: subjects.map((s, idx) => [
             idx + 1,
             s.subject_name,
-            s.subject_code || "-",
+            s.subject_code || resolveSubjectCode(s.subject_name, subjects) || "-",
             s.weekly_hours,
             s.course_category || (s.is_lab ? "Laboratory" : "Theory"),
             s.ltp || (s.is_lab ? "0-0-2" : "3-0-0"),
@@ -1186,17 +1223,47 @@ const GenerateAI = () => {
 
       for (const day in timetable) {
         for (const slot in timetable[day]) {
-          const subject = timetable[day][slot];
-          if (!subject || subject === "-") continue;
-          const teacherId = subjectTeacherMap[subject];
-          if (!teacherId) continue;
-          availabilityRows.push({
-            teacher_id: teacherId,
-            day_of_week: day,
-            time_slot: slot,
-            semester_id: semesterId,
-            is_busy: true,
-          });
+          const cell = timetable[day][slot];
+          if (!cell || cell === "-") continue;
+
+          if (typeof cell === "string") {
+            const teacherId = subjectTeacherMap[cell];
+            if (teacherId) {
+              availabilityRows.push({
+                teacher_id: teacherId,
+                day_of_week: day,
+                time_slot: slot,
+                semester_id: semesterId,
+                is_busy: true,
+              });
+            }
+          } else if (cell.batch_labs) {
+            cell.batch_labs.forEach((l) => {
+              const tId = l.teacher_id || subjectTeacherMap[l.subject_name || l.subject];
+              if (tId) {
+                availabilityRows.push({
+                  teacher_id: tId,
+                  day_of_week: day,
+                  time_slot: slot,
+                  semester_id: semesterId,
+                  is_busy: true,
+                });
+              }
+            });
+          } else if (cell.offerings) {
+            cell.offerings.forEach((off) => {
+              const tId = off.teacher_id || subjectTeacherMap[off.subject_name];
+              if (tId) {
+                availabilityRows.push({
+                  teacher_id: tId,
+                  day_of_week: day,
+                  time_slot: slot,
+                  semester_id: semesterId,
+                  is_busy: true,
+                });
+              }
+            });
+          }
         }
       }
 
@@ -1940,6 +2007,7 @@ const GenerateAI = () => {
                                 {cell.batch_labs.map((bl, bIdx) => (
                                   <div
                                     key={bIdx}
+                                    title={bl.subject_name}
                                     style={{
                                       background: "rgba(255, 255, 255, 0.85)",
                                       padding: "4px 8px",
@@ -1962,7 +2030,9 @@ const GenerateAI = () => {
                                     >
                                       {bl.batch}
                                     </span>
-                                    <b style={{ color: "#1e293b" }}>{bl.subject_name}</b>
+                                    <b style={{ color: "#1e293b", fontSize: "0.85rem" }}>
+                                      {bl.subject_code || bl.subject_name}
+                                    </b>
                                     <div style={{ fontSize: "0.7rem", color: "#64748b", marginTop: 2 }}>
                                       📍 {bl.room}
                                     </div>
@@ -1970,14 +2040,22 @@ const GenerateAI = () => {
                                 ))}
                               </div>
                             ) : (
-                              <div
-                                style={{
-                                  fontWeight: 700,
-                                  fontSize: "0.85rem",
-                                  marginTop: 4,
-                                }}
-                              >
-                                {cell.subject}
+                              <div title={cell.subject}>
+                                <div
+                                  style={{
+                                    fontWeight: 700,
+                                    fontSize: "0.88rem",
+                                    color: "#1e1b4b",
+                                    marginTop: 2,
+                                  }}
+                                >
+                                  {cell.subject_code || cell.subject}
+                                </div>
+                                {cell.room && (
+                                  <div style={{ fontSize: "0.7rem", color: "#64748b", marginTop: 2 }}>
+                                    📍 {cell.room}
+                                  </div>
+                                )}
                               </div>
                             )}
                           </td>
@@ -2039,27 +2117,34 @@ const GenerateAI = () => {
                               {cell.offerings.map((off, oIdx) => (
                                 <div
                                   key={oIdx}
+                                  title={off.subject_name}
                                   style={{
                                     background: "rgba(255,255,255,0.9)",
                                     padding: "3px 6px",
                                     borderRadius: 4,
-                                    fontSize: "0.75rem",
+                                    fontSize: "0.78rem",
                                     border: "1px solid #fed7aa",
                                     textAlign: "left",
                                   }}
                                 >
-                                  <b style={{ color: "#9a3412" }}>{off.subject_name}</b>
-                                  <div style={{ fontSize: "0.68rem", color: "#64748b" }}>
-                                    👨‍🏫 {off.teacher_name || off.teacher_id} | 📍 {off.room_name || off.room}
-                                  </div>
+                                  <b style={{ color: "#9a3412", fontSize: "0.82rem" }}>
+                                    {off.subject_code || off.subject_name}
+                                  </b>
+                                  {(off.room_name || off.room) && (
+                                    <div style={{ fontSize: "0.68rem", color: "#64748b", marginTop: 1 }}>
+                                      📍 {off.room_name || off.room}
+                                    </div>
+                                  )}
                                 </div>
                               ))}
                             </div>
                           ) : (
-                            <div>
-                              <div style={{ fontWeight: 600 }}>{cell.subject}</div>
+                            <div title={cell.subject}>
+                              <div style={{ fontWeight: 700, fontSize: "0.88rem", color: "#1e1b4b" }}>
+                                {cell.subject_code || cell.subject}
+                              </div>
                               {cell.room && (
-                                <div style={{ fontSize: "0.7rem", color: "#64748b" }}>
+                                <div style={{ fontSize: "0.7rem", color: "#64748b", marginTop: 2 }}>
                                   📍 {cell.room}
                                 </div>
                               )}
@@ -2136,7 +2221,7 @@ const GenerateAI = () => {
                         fontSize: "smaller",
                       }}
                     >
-                      {subject.subject_code || "-"}
+                      {subject.subject_code || resolveSubjectCode(subject.subject_name, generationData?.data?.subjects) || "-"}
                     </td>
                     <td
                       style={{

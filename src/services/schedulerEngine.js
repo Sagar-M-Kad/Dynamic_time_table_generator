@@ -64,6 +64,271 @@ export const getConsecutiveLabWindows = (fullSlots, labDurationHours = 2) => {
   return windows;
 };
 
+// ── UTILITY: NORMALIZE SLOT LABELS ───────────────────────────────────────────
+// Accepts "08:00 AM-09:00 AM" or "08:00 AM", returns { full, start }
+export const normalizeSlotLabel = (slot) => {
+  if (!slot || typeof slot !== "string") return { full: "", start: "" };
+  const clean = slot.trim();
+  if (clean.includes("-")) {
+    const parts = clean.split("-");
+    const start = parts[0].trim();
+    const end = parts[1].trim();
+    return {
+      full: `${start}-${end}`,
+      start: start,
+    };
+  }
+  return {
+    full: clean,
+    start: clean,
+  };
+};
+
+// ── UTILITY: CURRICULUM SUBJECT CODE MAPPINGS ────────────────────────────────
+export const subjectCodeFallbacks = {
+  "cryptography and network security": "22UCSC700",
+  "cryptography and network security laboratory": "22UCSL701",
+  "blockchain technology": "22UCSO740",
+  "distributed systems and applications": "22UCSE720",
+  "distrubuted systems and applications": "22UCSE720",
+  "distributed systems": "22UCSE720",
+  "natural language processing": "22UCSE721",
+  "natural processing language": "22UCSE721",
+  "nlp": "22UCSE721",
+  "deep learning and applications": "22UCSE730",
+  "deep learning": "22UCSE730",
+  "software testing": "22UCSE731",
+  "major project-i": "22UCSL702",
+  "major project": "22UCSL702",
+};
+
+export const resolveSubjectCode = (subName, subjectList = []) => {
+  if (!subName) return "";
+  const cleanName = String(subName).trim().toLowerCase();
+
+  // 1. Exact match in passed subject list
+  const found = (subjectList || []).find(
+    (s) => (s.subject_name || "").trim().toLowerCase() === cleanName
+  );
+  if (found?.subject_code) return found.subject_code;
+
+  // 2. Exact match in known fallbacks
+  if (subjectCodeFallbacks[cleanName]) return subjectCodeFallbacks[cleanName];
+
+  // 3. Substring matching in passed subject list
+  const partial = (subjectList || []).find((s) => {
+    const sName = (s.subject_name || "").trim().toLowerCase();
+    return sName && (cleanName.includes(sName) || sName.includes(cleanName));
+  });
+  if (partial?.subject_code) return partial.subject_code;
+
+  // 4. Substring matching in known fallbacks
+  for (const [key, code] of Object.entries(subjectCodeFallbacks)) {
+    if (cleanName.includes(key) || key.includes(cleanName)) {
+      return code;
+    }
+  }
+
+  return "";
+};
+
+// ── UTILITY: BIDIRECTIONAL TEACHER & SUBJECT MAPPING ─────────────────────────
+export const buildTeacherMaps = (teacherLinks = [], teachersList = []) => {
+  const idToName = new Map();
+  const nameToId = new Map();
+  const subjectToTeacherId = new Map();
+  const subjectToTeacherName = new Map();
+
+  const normalizeName = (name) =>
+    (name || "")
+      .trim()
+      .toLowerCase()
+      .replace(/^prof\.?\s+/i, "")
+      .replace(/^dr\.?\s+/i, "");
+
+  // 1. Ingest teachers directly if available
+  (teachersList || []).forEach((t) => {
+    if (!t) return;
+    const tid = String(t.id).trim();
+    const tname = (t.name || "").trim();
+    if (tid) {
+      idToName.set(tid, tname);
+      if (tname) {
+        nameToId.set(tname.toLowerCase(), tid);
+        const norm = normalizeName(tname);
+        if (norm) nameToId.set(norm, tid);
+      }
+    }
+  });
+
+  // 2. Ingest teacherLinks (tl.teacher_id, tl.teachers.name, tl.subjects.subject_name)
+  (teacherLinks || []).forEach((tl) => {
+    if (!tl) return;
+    const tid = tl.teacher_id != null ? String(tl.teacher_id).trim() : null;
+    const tname = (tl.teachers?.name || tl.teacher_name || "").trim();
+    const sname = (tl.subjects?.subject_name || "").trim().toLowerCase();
+
+    if (tid && tname) {
+      idToName.set(tid, tname);
+      nameToId.set(tname.toLowerCase(), tid);
+      const norm = normalizeName(tname);
+      if (norm) nameToId.set(norm, tid);
+    } else if (tid && !idToName.has(tid)) {
+      idToName.set(tid, `Teacher ${tid}`);
+    }
+
+    if (sname) {
+      if (tid) subjectToTeacherId.set(sname, tid);
+      if (tname) subjectToTeacherName.set(sname, tname);
+    }
+  });
+
+  return { idToName, nameToId, subjectToTeacherId, subjectToTeacherName, normalizeName };
+};
+
+// ── UTILITY: BUILD COMPOSITE BUSY INDEX ──────────────────────────────────────
+export const buildTeacherBusyIndex = (teacherBusyList = [], teacherMaps = null) => {
+  const busySet = new Set();
+
+  (teacherBusyList || []).forEach((b) => {
+    if (!b) return;
+    const day = (b.day_of_week || "").trim();
+    const rawSlot = (b.time_slot || "").trim();
+    if (!day || !rawSlot) return;
+
+    const { full, start } = normalizeSlotLabel(rawSlot);
+
+    const rawId = b.teacher_id != null ? String(b.teacher_id).trim() : "";
+    const idsAndNames = new Set();
+    if (rawId) {
+      idsAndNames.add(rawId);
+      idsAndNames.add(rawId.toLowerCase());
+      if (teacherMaps) {
+        // If rawId is an ID, also index the teacher's name
+        const mappedName = teacherMaps.idToName.get(rawId);
+        if (mappedName) {
+          idsAndNames.add(mappedName);
+          idsAndNames.add(mappedName.toLowerCase());
+          const norm = teacherMaps.normalizeName(mappedName);
+          if (norm) idsAndNames.add(norm);
+        }
+        // If rawId is a Name, also index the numeric ID
+        const mappedId = teacherMaps.nameToId.get(rawId.toLowerCase());
+        if (mappedId) {
+          idsAndNames.add(mappedId);
+        }
+      }
+    }
+
+    idsAndNames.forEach((idOrName) => {
+      busySet.add(`${idOrName}_${day}_${rawSlot}`);
+      if (start) busySet.add(`${idOrName}_${day}_${start}`);
+      if (full) busySet.add(`${idOrName}_${day}_${full}`);
+    });
+  });
+
+  return busySet;
+};
+
+// ── UTILITY: CHECK IF TEACHER IS BUSY ────────────────────────────────────────
+export const isTeacherBusy = (busySet, teacherIdOrName, day, slot, teacherMaps = null) => {
+  if (!busySet || !teacherIdOrName || !day || !slot) return false;
+  const tidStr = String(teacherIdOrName).trim();
+  const { full, start } = normalizeSlotLabel(String(slot));
+
+  const candidateKeys = [
+    `${tidStr}_${day}_${slot}`,
+    `${tidStr}_${day}_${start}`,
+    `${tidStr.toLowerCase()}_${day}_${slot}`,
+    `${tidStr.toLowerCase()}_${day}_${start}`,
+  ];
+  if (full) {
+    candidateKeys.push(
+      `${tidStr}_${day}_${full}`,
+      `${tidStr.toLowerCase()}_${day}_${full}`
+    );
+  }
+
+  if (teacherMaps) {
+    // If tidStr is an ID, check mapped name
+    const mappedName = teacherMaps.idToName.get(tidStr);
+    if (mappedName) {
+      candidateKeys.push(
+        `${mappedName}_${day}_${slot}`,
+        `${mappedName}_${day}_${start}`,
+        `${mappedName.toLowerCase()}_${day}_${slot}`,
+        `${mappedName.toLowerCase()}_${day}_${start}`
+      );
+      if (full) {
+        candidateKeys.push(
+          `${mappedName}_${day}_${full}`,
+          `${mappedName.toLowerCase()}_${day}_${full}`
+        );
+      }
+    }
+    // If tidStr is a Name, check mapped ID
+    const mappedId = teacherMaps.nameToId.get(tidStr.toLowerCase());
+    if (mappedId) {
+      candidateKeys.push(
+        `${mappedId}_${day}_${slot}`,
+        `${mappedId}_${day}_${start}`,
+        `${mappedId.toLowerCase()}_${day}_${slot}`,
+        `${mappedId.toLowerCase()}_${day}_${start}`
+      );
+      if (full) {
+        candidateKeys.push(
+          `${mappedId}_${day}_${full}`,
+          `${mappedId.toLowerCase()}_${day}_${full}`
+        );
+      }
+    }
+  }
+
+  return candidateKeys.some((k) => busySet.has(k));
+};
+
+// ── UTILITY: RECORD TEACHER OCCUPANCY IN SLOT ────────────────────────────────
+export const recordTeacherSlotUsage = (usageSet, teacherIdOrName, day, slot, teacherMaps = null) => {
+  if (!usageSet || !teacherIdOrName || !day || !slot) return;
+  const tidStr = String(teacherIdOrName).trim();
+  const { full, start } = normalizeSlotLabel(String(slot));
+
+  const keys = [
+    `${tidStr}_${day}_${slot}`,
+    `${tidStr}_${day}_${start}`,
+    `${tidStr.toLowerCase()}_${day}_${slot}`,
+    `${tidStr.toLowerCase()}_${day}_${start}`,
+  ];
+  if (full) {
+    keys.push(`${tidStr}_${day}_${full}`, `${tidStr.toLowerCase()}_${day}_${full}`);
+  }
+
+  if (teacherMaps) {
+    const mappedName = teacherMaps.idToName.get(tidStr);
+    if (mappedName) {
+      keys.push(
+        `${mappedName}_${day}_${slot}`,
+        `${mappedName}_${day}_${start}`,
+        `${mappedName.toLowerCase()}_${day}_${slot}`,
+        `${mappedName.toLowerCase()}_${day}_${start}`
+      );
+      if (full) keys.push(`${mappedName}_${day}_${full}`, `${mappedName.toLowerCase()}_${day}_${full}`);
+    }
+    const mappedId = teacherMaps.nameToId.get(tidStr.toLowerCase());
+    if (mappedId) {
+      keys.push(
+        `${mappedId}_${day}_${slot}`,
+        `${mappedId}_${day}_${start}`,
+        `${mappedId.toLowerCase()}_${day}_${slot}`,
+        `${mappedId.toLowerCase()}_${day}_${start}`
+      );
+      if (full) keys.push(`${mappedId}_${day}_${full}`, `${mappedId.toLowerCase()}_${day}_${full}`);
+    }
+  }
+
+  keys.forEach((k) => usageSet.add(k));
+};
+
 // ── 1B. PARALLEL ELECTIVE BASKET SYNTHESIZER ─────────────────────────────────
 export const synthesizeElectiveGroupsAndOfferings = ({
   subjects = [],
@@ -88,12 +353,13 @@ export const synthesizeElectiveGroupsAndOfferings = ({
 
   const defaultRoomsList = [primaryTheoryRoom, seminarRoom, "Room-23", "CSE Seminar Hall-2"];
 
+  const teacherMaps = buildTeacherMaps(teacherLinks, resources.teachers || []);
   const subjectTeacherMap = {};
   teacherLinks.forEach((tl) => {
     const name = tl.subjects?.subject_name;
     if (name) {
       subjectTeacherMap[name.trim().toLowerCase()] =
-        tl.teachers?.name || tl.teacher_id;
+        tl.teacher_id != null ? tl.teacher_id : (tl.teachers?.name || tl.teacher_id);
     }
   });
 
@@ -197,21 +463,45 @@ export const synthesizeElectiveGroupsAndOfferings = ({
             ? defaultRoomsList[idx]
             : `Room-${22 + idx}`;
 
-        const teacherId =
-          subjectTeacherMap[sNorm] ||
-          facultyFallbacks[sNorm] ||
-          sub.teacher_name ||
+        // Resolve canonical teacher ID and display name
+        let resolvedTeacherId =
+          teacherMaps.subjectToTeacherId.get(sNorm) ||
           sub.teacher_id ||
-          `Prof. ${sub.subject_name.split(" ")[0]}`;
+          subjectTeacherMap[sNorm] ||
+          null;
+        let resolvedTeacherName =
+          teacherMaps.subjectToTeacherName.get(sNorm) ||
+          sub.teacher_name ||
+          null;
+
+        if (!resolvedTeacherId && resolvedTeacherName) {
+          resolvedTeacherId = teacherMaps.nameToId.get(resolvedTeacherName.toLowerCase()) || null;
+        }
+
+        if (!resolvedTeacherName && facultyFallbacks[sNorm]) {
+          resolvedTeacherName = facultyFallbacks[sNorm];
+          if (!resolvedTeacherId) {
+            resolvedTeacherId = teacherMaps.nameToId.get(resolvedTeacherName.toLowerCase()) || null;
+          }
+        }
+
+        if (resolvedTeacherId && !resolvedTeacherName) {
+          resolvedTeacherName = teacherMaps.idToName.get(String(resolvedTeacherId)) || `Teacher ${resolvedTeacherId}`;
+        }
+
+        const finalTeacherId = resolvedTeacherId || resolvedTeacherName || `Prof. ${sub.subject_name.split(" ")[0]}`;
+        const finalTeacherName = resolvedTeacherName || (resolvedTeacherId ? teacherMaps.idToName.get(String(resolvedTeacherId)) : null) || String(finalTeacherId);
+
+        const sCode = sub.subject_code || resolveSubjectCode(sub.subject_name, subjects);
 
         synthesizedOfferings.push({
           id: `off-${cluster.groupId}-${sub.id || idx}`,
           elective_group_id: cluster.groupId,
-          course_id: sub.id || sub.subject_code || String(idx + 101),
-          subject_code: sub.subject_code,
+          course_id: sub.id || sCode || String(idx + 101),
+          subject_code: sCode,
           subject_name: sub.subject_name,
-          teacher_id: teacherId,
-          teacher_name: teacherId,
+          teacher_id: finalTeacherId,
+          teacher_name: finalTeacherName,
           room_id: assignedRoom,
           room_name: assignedRoom,
           room: assignedRoom,
@@ -371,17 +661,16 @@ export const validateSchedule = ({
       1
   );
 
-  // Build subject -> teacher lookup
+  // Build subject -> teacher lookup & teacher maps
+  const teacherMaps = buildTeacherMaps(teacherLinks, academicStructure?.teachers || []);
   const subjectTeacherMap = {};
   (teacherLinks || []).forEach((link) => {
     const name = link.subjects?.subject_name;
     if (name) subjectTeacherMap[name] = link.teacher_id;
   });
 
-  // Build teacher busy set from DB: "teacherId_day_slot"
-  const busySet = new Set(
-    (teacherBusy || []).map((b) => `${b.teacher_id}_${b.day_of_week}_${b.time_slot}`)
-  );
+  // Build teacher busy set from DB with start & full slot indexing and bidirectional mapping
+  const busySet = buildTeacherBusyIndex(teacherBusy, teacherMaps);
 
   // Maximum workload guardrails
   const maxDaily = parseInt(constraints.max_daily_hours) || 4;
@@ -493,8 +782,9 @@ export const validateSchedule = ({
 
           // Teacher Checks
           if (teacherId) {
-            const tKey = `${teacherId}_${day}_${slot}`;
-            if (busySet.has(tKey)) {
+            const canonicalTId = teacherMaps.nameToId.get(String(teacherId).toLowerCase()) || String(teacherId);
+            const tKey = `${canonicalTId}_${day}_${slot}`;
+            if (isTeacherBusy(busySet, teacherId, day, slot, teacherMaps)) {
               violations.push({
                 code: "TEACHER_BUSY",
                 day,
@@ -578,7 +868,8 @@ export const validateSchedule = ({
           // Rule: Different elective options in the same group should normally be scheduled in parallel
           // during the configured elective period, using separate qualified teachers and suitable rooms.
           if (oTeacher) {
-            if (slotOfferingTeachers.has(oTeacher)) {
+            const canonicalOTeacher = teacherMaps.nameToId.get(String(oTeacher).toLowerCase()) || String(oTeacher);
+            if (slotOfferingTeachers.has(canonicalOTeacher)) {
               violations.push({
                 code: "ELECTIVE_FACULTY_CONFLICT",
                 day,
@@ -588,10 +879,10 @@ export const validateSchedule = ({
                 message: `Parallel elective options in the same group on ${day} at ${slot} must use separate teachers. Teacher "${oTeacher}" is assigned to multiple offerings.`,
               });
             }
-            slotOfferingTeachers.add(oTeacher);
+            slotOfferingTeachers.add(canonicalOTeacher);
 
-            const tKey = `${oTeacher}_${day}_${slot}`;
-            if (busySet.has(tKey)) {
+            const tKey = `${canonicalOTeacher}_${day}_${slot}`;
+            if (isTeacherBusy(busySet, oTeacher, day, slot, teacherMaps)) {
               violations.push({
                 code: "TEACHER_BUSY",
                 day,
@@ -699,8 +990,9 @@ export const validateSchedule = ({
 
           // Teacher checks
           if (teacherId) {
-            const tKey = `${teacherId}_${day}_${slot}`;
-            if (busySet.has(tKey)) {
+            const canonicalTId = teacherMaps.nameToId.get(String(teacherId).toLowerCase()) || String(teacherId);
+            const tKey = `${canonicalTId}_${day}_${slot}`;
+            if (isTeacherBusy(busySet, teacherId, day, slot, teacherMaps)) {
               violations.push({
                 code: "TEACHER_BUSY",
                 day,
@@ -724,8 +1016,8 @@ export const validateSchedule = ({
             teacherTimeMap[tKey] = subName;
 
             // Daily Workload
-            teacherDailyHours[teacherId] = (teacherDailyHours[teacherId] || 0) + 1;
-            if (teacherDailyHours[teacherId] > maxDaily) {
+            teacherDailyHours[canonicalTId] = (teacherDailyHours[canonicalTId] || 0) + 1;
+            if (teacherDailyHours[canonicalTId] > maxDaily) {
               violations.push({
                 code: "TEACHER_OVERLOAD",
                 day,
@@ -737,8 +1029,8 @@ export const validateSchedule = ({
             }
 
             // Consecutive Hours
-            teacherConsecutiveHours[teacherId] = (teacherConsecutiveHours[teacherId] || 0) + 1;
-            if (teacherConsecutiveHours[teacherId] > maxConsec) {
+            teacherConsecutiveHours[canonicalTId] = (teacherConsecutiveHours[canonicalTId] || 0) + 1;
+            if (teacherConsecutiveHours[canonicalTId] > maxConsec) {
               violations.push({
                 code: "TEACHER_FATIGUE",
                 day,
@@ -816,12 +1108,13 @@ export const validateSchedule = ({
         if (!otherCell || otherCell === "-") continue;
 
         // Extract subjects, teachers, and rooms from otherCell
-        const otherEntries = otherCell.batch_labs || [otherCell];
+        const otherEntries = otherCell.batch_labs || (otherCell.offerings ? otherCell.offerings : [otherCell]);
         otherEntries.forEach((entry) => {
           const oSub = entry.subject_name || entry.subject || (typeof entry === "string" ? entry : null);
           const oTeacher = entry.teacher_id || subjectTeacherMap[oSub];
           if (oTeacher) {
-            const tKey = `${oTeacher}_${d}_${sl}`;
+            const canonicalOTeacher = teacherMaps.nameToId.get(String(oTeacher).toLowerCase()) || String(oTeacher);
+            const tKey = `${canonicalOTeacher}_${d}_${sl}`;
             if (teacherTimeMap[tKey]) {
               violations.push({
                 code: "CROSS_DIVISION_CONFLICT",
@@ -1086,15 +1379,14 @@ export const generateDeterministicTimetable = ({
   );
 
   const teacherLinks = resources.teacherLinks || [];
+  const teacherMaps = buildTeacherMaps(teacherLinks, resources.teachers || []);
   const subjectTeacherMap = {};
   teacherLinks.forEach((tl) => {
     const name = tl.subjects?.subject_name;
     if (name) subjectTeacherMap[name] = tl.teacher_id;
   });
 
-  const teacherBusySet = new Set(
-    (busyMap.teacherBusy || []).map((b) => `${b.teacher_id}_${b.day_of_week}_${b.time_slot}`)
-  );
+  const teacherBusySet = buildTeacherBusyIndex(busyMap.teacherBusy || [], teacherMaps);
 
   const rooms = resources.rooms || [];
   const labRooms = rooms.filter((r) => r.is_lab || r.room_name?.toLowerCase().includes("lab"));
@@ -1111,12 +1403,18 @@ export const generateDeterministicTimetable = ({
       classSlots.forEach((sl) => {
         const oCell = oTT[d]?.[sl];
         if (!oCell || oCell === "-") return;
-        const entries = oCell.batch_labs || [oCell];
+        const entries = oCell.batch_labs || (oCell.offerings ? oCell.offerings : [oCell]);
         entries.forEach((e) => {
           const tId = e.teacher_id || subjectTeacherMap[e.subject_name || e.subject];
-          if (tId) crossBusyTeachers.add(`${tId}_${d}_${sl}`);
+          if (tId) {
+            recordTeacherSlotUsage(crossBusyTeachers, tId, d, sl, teacherMaps);
+          }
           const rId = e.room_id || e.room;
-          if (rId) crossBusyRooms.add(`${rId}_${d}_${sl}`);
+          if (rId) {
+            crossBusyRooms.add(`${rId}_${d}_${sl}`);
+            const startSl = sl.split("-")[0].trim();
+            crossBusyRooms.add(`${rId}_${d}_${startSl}`);
+          }
         });
       });
     });
@@ -1181,6 +1479,7 @@ export const generateDeterministicTimetable = ({
     });
 
     const teacherSlotUsage = {};
+    const teacherSlotUsageSet = new Set();
     const roomSlotUsage = {};
     const batchDailyCount = {};
     batches.forEach((b) => {
@@ -1232,13 +1531,19 @@ export const generateDeterministicTimetable = ({
           for (const off of groupOfferings) {
             const tId = off.teacher_id || subjectTeacherMap[off.subject_name];
             if (tId) {
-              if (currentSlotTeachers.has(tId)) {
+              const canonicalTId = teacherMaps.nameToId.get(String(tId).toLowerCase()) || String(tId);
+              if (currentSlotTeachers.has(canonicalTId)) {
                 allOfferingsAvailable = false;
                 break;
               }
-              currentSlotTeachers.add(tId);
+              currentSlotTeachers.add(canonicalTId);
               const tk = `${tId}_${day}_${slot}`;
-              if (teacherBusySet.has(tk) || teacherSlotUsage[tk] || crossBusyTeachers.has(tk)) {
+              if (
+                isTeacherBusy(teacherBusySet, tId, day, slot, teacherMaps) ||
+                isTeacherBusy(teacherSlotUsageSet, tId, day, slot, teacherMaps) ||
+                isTeacherBusy(crossBusyTeachers, tId, day, slot, teacherMaps) ||
+                teacherSlotUsage[tk]
+              ) {
                 allOfferingsAvailable = false;
                 break;
               }
@@ -1251,7 +1556,13 @@ export const generateDeterministicTimetable = ({
               }
               currentSlotRooms.add(rId);
               const rk = `${rId}_${day}_${slot}`;
-              if (roomSlotUsage[rk] || crossBusyRooms.has(rk)) {
+              const startSlot = slot.split("-")[0].trim();
+              if (
+                roomSlotUsage[rk] ||
+                roomSlotUsage[`${rId}_${day}_${startSlot}`] ||
+                crossBusyRooms.has(rk) ||
+                crossBusyRooms.has(`${rId}_${day}_${startSlot}`)
+              ) {
                 allOfferingsAvailable = false;
                 break;
               }
@@ -1297,9 +1608,15 @@ export const generateDeterministicTimetable = ({
           // Mark resources
           groupOfferings.forEach((o) => {
             const tId = o.teacher_id || subjectTeacherMap[o.subject_name];
-            if (tId) teacherSlotUsage[`${tId}_${day}_${slot}`] = `${o.subject_name} (Elective)`;
+            if (tId) {
+              teacherSlotUsage[`${tId}_${day}_${slot}`] = `${o.subject_name} (Elective)`;
+              recordTeacherSlotUsage(teacherSlotUsageSet, tId, day, slot, teacherMaps);
+            }
             const rId = o.room_id || o.room;
-            if (rId) roomSlotUsage[`${rId}_${day}_${slot}`] = `${o.subject_name} (Elective)`;
+            if (rId) {
+              roomSlotUsage[`${rId}_${day}_${slot}`] = `${o.subject_name} (Elective)`;
+              roomSlotUsage[`${rId}_${day}_${slot.split("-")[0].trim()}`] = `${o.subject_name} (Elective)`;
+            }
           });
 
           hoursPlaced++;
@@ -1353,9 +1670,18 @@ export const generateDeterministicTimetable = ({
           if (teacherId) {
             const k1 = `${teacherId}_${day}_${s1}`;
             const k2 = `${teacherId}_${day}_${s2}`;
-            if (teacherBusySet.has(k1) || teacherBusySet.has(k2)) continue;
-            if (teacherSlotUsage[k1] || teacherSlotUsage[k2]) continue;
-            if (crossBusyTeachers.has(k1) || crossBusyTeachers.has(k2)) continue;
+            if (
+              isTeacherBusy(teacherBusySet, teacherId, day, s1, teacherMaps) ||
+              isTeacherBusy(teacherBusySet, teacherId, day, s2, teacherMaps) ||
+              isTeacherBusy(teacherSlotUsageSet, teacherId, day, s1, teacherMaps) ||
+              isTeacherBusy(teacherSlotUsageSet, teacherId, day, s2, teacherMaps) ||
+              isTeacherBusy(crossBusyTeachers, teacherId, day, s1, teacherMaps) ||
+              isTeacherBusy(crossBusyTeachers, teacherId, day, s2, teacherMaps) ||
+              teacherSlotUsage[k1] ||
+              teacherSlotUsage[k2]
+            ) {
+              continue;
+            }
           }
 
           // Find an available lab room
@@ -1395,8 +1721,10 @@ export const generateDeterministicTimetable = ({
           if (bAlreadyBusy(cell1) || bAlreadyBusy(cell2)) continue;
 
           // Place lab entry into both slots (strictly 2 consecutive hours)
+          const sCode = sub.subject_code || resolveSubjectCode(sub.subject_name, canonicalSubjects);
           const labEntry1 = {
             subject_name: sub.subject_name,
+            subject_code: sCode,
             batch,
             teacher_id: teacherId,
             room: assignedRoom || "Lab 1",
@@ -1407,6 +1735,7 @@ export const generateDeterministicTimetable = ({
 
           const labEntry2 = {
             subject_name: sub.subject_name,
+            subject_code: sCode,
             batch,
             teacher_id: teacherId,
             room: assignedRoom || "Lab 1",
@@ -1431,6 +1760,8 @@ export const generateDeterministicTimetable = ({
           if (teacherId) {
             teacherSlotUsage[`${teacherId}_${day}_${s1}`] = `${sub.subject_name}-${batch}`;
             teacherSlotUsage[`${teacherId}_${day}_${s2}`] = `${sub.subject_name}-${batch}`;
+            recordTeacherSlotUsage(teacherSlotUsageSet, teacherId, day, s1, teacherMaps);
+            recordTeacherSlotUsage(teacherSlotUsageSet, teacherId, day, s2, teacherMaps);
           }
           if (assignedRoom) {
             roomSlotUsage[`${assignedRoom}_${day}_${s1}`] = `${sub.subject_name}-${batch}`;
@@ -1487,9 +1818,15 @@ export const generateDeterministicTimetable = ({
           // Check teacher availability
           const tId = subjectTeacherMap[ts.subject_name];
           if (tId) {
-            if (teacherBusySet.has(`${tId}_${day}_${slot}`)) return false;
-            if (teacherSlotUsage[`${tId}_${day}_${slot}`]) return false;
-            if (crossBusyTeachers.has(`${tId}_${day}_${slot}`)) return false;
+            const tk = `${tId}_${day}_${slot}`;
+            if (
+              isTeacherBusy(teacherBusySet, tId, day, slot, teacherMaps) ||
+              isTeacherBusy(teacherSlotUsageSet, tId, day, slot, teacherMaps) ||
+              isTeacherBusy(crossBusyTeachers, tId, day, slot, teacherMaps) ||
+              teacherSlotUsage[tk]
+            ) {
+              return false;
+            }
           }
           return true;
         });
@@ -1505,15 +1842,20 @@ export const generateDeterministicTimetable = ({
         const chosen = candidates[0];
         const chosenNorm = chosen.subject_name.trim().toLowerCase();
 
+        const sCode = chosen.subject_code || resolveSubjectCode(chosen.subject_name, canonicalSubjects);
         timetable[day][slot] = {
           subject_name: chosen.subject_name,
+          subject_code: sCode,
           is_lab: false,
           room: defaultTheoryRoom,
           teacher_id: subjectTeacherMap[chosen.subject_name],
         };
 
         const tId = subjectTeacherMap[chosen.subject_name];
-        if (tId) teacherSlotUsage[`${tId}_${day}_${slot}`] = chosen.subject_name;
+        if (tId) {
+          teacherSlotUsage[`${tId}_${day}_${slot}`] = chosen.subject_name;
+          recordTeacherSlotUsage(teacherSlotUsageSet, tId, day, slot, teacherMaps);
+        }
         remainingTheory[chosenNorm]--;
       }
     }
